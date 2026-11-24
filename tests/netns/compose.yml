@@ -1,0 +1,45 @@
+# `just proxy-check`: the ONVIF proxy must follow its go2rtc into a new network namespace after
+# go2rtc crashes and is restarted by its restart policy. The camera behind the proxy is a
+# documentation address (TEST-NET-1): nothing is ever reached on the LAN.
+name: moonie-cams-netns
+
+x-python: &python
+  # Same pinned base as proxy/Dockerfile
+  image: python:3.13.18-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+  environment:
+    PYTHONDONTWRITEBYTECODE: "1"
+  volumes:
+    - ./:/check:ro
+
+services:
+  cam:
+    <<: *python
+    restart: unless-stopped
+    command: ["python", "/check/fake_go2rtc.py"]
+
+  cam-onvif:
+    build: ../../proxy
+    image: moonie-cams-onvif-proxy:check
+    restart: unless-stopped
+    network_mode: service:cam
+    depends_on: [cam]
+    # Same hardening as the rendered compose (app.py proxy_service): this check proves it runs so
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:size=16m"]
+    environment:
+      ONVIF_CAMERA: http://192.0.2.10:2020
+      ONVIF_STREAMS: '{"/stream1": "cam"}'
+      COPY_IP: 192.0.2.20
+      COPY_MAC: 02:00:00:00:00:01
+      COPY_HOSTNAME: cams-cam
+      RTSP_PORT: "554"
+      SNAPSHOT_PORT: "1984"
+      HTTP_PORTS: "80 2020"
+
+  probe:
+    <<: *python
+    profiles: [probe]
+    command: ["python", "/check/probe.py"]

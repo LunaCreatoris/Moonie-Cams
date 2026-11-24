@@ -1,0 +1,17 @@
+# Local settings and secrets
+cameras.yaml
+.env
+secrets/*
+!secrets/.gitkeep
+# Render output
+generated/
+.check/
+.copy-check/
+# Tooling
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+._*
+.smbdelete*

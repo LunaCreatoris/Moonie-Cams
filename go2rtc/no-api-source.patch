@@ -1,0 +1,629 @@
+API lookups only find streams that exist, for go2rtc v1.9.15 (7c05066).
+Upstream's streams.GetOrPatch, behind api/frame.jpeg, api/stream.mjpeg, api/stream.mp4,
+api/stream.m3u8 and every api/ws handler (webrtc, mse, mp4, hls, mjpeg), created a stream from a
+src URL, or set an existing stream's source from src with name=: any client that reaches the API
+could point a camera's stream at its own producer (GET /api/frame.jpeg?src=rtsp://host/x&name=cam)
+or make go2rtc dial any host. GetOrPatch now only returns the stream named by src. The HTTP and
+WebSocket pushes into a stream (POST api/stream.mjpeg?dst=, WHIP POST api/webrtc?dst=, api/ws?dst=,
+and WHEP POST api/webrtc?src= with an offer that sends video, which upstream's ExchangeSDP turned
+into a producer) are refused with 403 (streams.ErrPushDisabled), so a client cannot add its own
+producer either. A WebSocket offer's own ice_servers are ignored: only the config's ICE servers
+are used, so a client cannot make go2rtc send STUN or TURN to any host. Config streams, ffmpeg:
+loopback sources and RTSP publishing (which authenticates on a public listener) are unchanged;
+the other pushes (api/stream.ts, api/stream.flv, api/stream, hass) sit on paths app.py never
+allows. Comes with its own tests (go test ./internal/streams/ ./internal/mjpeg/ ./internal/webrtc/).
+
+diff --git a/internal/mjpeg/mjpeg.go b/internal/mjpeg/mjpeg.go
+index e9f973a..7fe8a62 100644
+--- a/internal/mjpeg/mjpeg.go
++++ b/internal/mjpeg/mjpeg.go
+@@ -2,7 +2,6 @@ package mjpeg
+ 
+ import (
+ 	"errors"
+-	"io"
+ 	"net/http"
+ 	"strconv"
+ 	"strings"
+@@ -18,7 +17,6 @@ import (
+ 	"github.com/AlexxIT/go2rtc/pkg/core"
+ 	"github.com/AlexxIT/go2rtc/pkg/magic"
+ 	"github.com/AlexxIT/go2rtc/pkg/mjpeg"
+-	"github.com/AlexxIT/go2rtc/pkg/mpjpeg"
+ 	"github.com/AlexxIT/go2rtc/pkg/y4m"
+ 	"github.com/rs/zerolog"
+ )
+@@ -170,24 +168,10 @@ func outputMjpeg(w http.ResponseWriter, r *http.Request) {
+ 	stream.RemoveConsumer(cons)
+ }
+ 
+-func inputMjpeg(w http.ResponseWriter, r *http.Request) {
+-	dst := r.URL.Query().Get("dst")
+-	stream := streams.Get(dst)
+-	if stream == nil {
+-		http.Error(w, api.StreamNotFound, http.StatusNotFound)
+-		return
+-	}
+-
+-	prod, _ := mpjpeg.Open(r.Body)
+-	prod.WithRequest(r)
+-
+-	stream.AddProducer(prod)
+-
+-	if err := prod.Start(); err != nil && err != io.EOF {
+-		log.Warn().Err(err).Caller().Send()
+-	}
+-
+-	stream.RemoveProducer(prod)
++// inputMjpeg refuses upstream's MJPEG push (POST ?dst=): a client may not add its own
++// producer to a stream, whose producers come from the config only.
++func inputMjpeg(w http.ResponseWriter, _ *http.Request) {
++	http.Error(w, streams.ErrPushDisabled.Error(), http.StatusForbidden)
+ }
+ 
+ func handlerWS(tr *ws.Transport, _ *ws.Message) error {
+diff --git a/internal/mjpeg/mjpeg_test.go b/internal/mjpeg/mjpeg_test.go
+new file mode 100644
+index 0000000..a27871a
+--- /dev/null
++++ b/internal/mjpeg/mjpeg_test.go
+@@ -0,0 +1,85 @@
++package mjpeg
++
++import (
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/AlexxIT/go2rtc/internal/api/ws"
++	"github.com/AlexxIT/go2rtc/internal/streams"
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/stretchr/testify/require"
++)
++
++// configCam adds a config stream "cam" behind a fake rtsp handler that records every dial.
++func configCam(t *testing.T) (*streams.Stream, func() []string) {
++	var mu sync.Mutex
++	var dials []string
++	streams.HandleFunc("rtsp", func(source string) (core.Producer, error) {
++		mu.Lock()
++		dials = append(dials, source)
++		mu.Unlock()
++		return nil, errors.New("fake rtsp: no dial in tests")
++	})
++	cam, err := streams.New("cam", "rtsp://192.0.2.2/real")
++	require.NoError(t, err)
++	t.Cleanup(func() {
++		for _, name := range streams.GetAllNames() {
++			streams.Delete(name)
++		}
++	})
++	return cam, func() []string {
++		mu.Lock()
++		defer mu.Unlock()
++		return append([]string(nil), dials...)
++	}
++}
++
++func requireUnchanged(t *testing.T, cam *streams.Stream, dials func() []string) {
++	t.Helper()
++	require.Equal(t, []string{"cam"}, streams.GetAllNames())
++	require.Same(t, cam, streams.Get("cam"))
++	require.Equal(t, []string{"rtsp://192.0.2.2/real"}, cam.Sources())
++	require.Empty(t, dials())
++}
++
++func TestFrameRefusesSourceFromQuery(t *testing.T) {
++	cam, dials := configCam(t)
++
++	for _, query := range []string{"src=rtsp://192.0.2.1/x&name=cam", "src=rtsp://192.0.2.1/x"} {
++		w := httptest.NewRecorder()
++		handlerKeyframe(w, httptest.NewRequest("GET", "/api/frame.jpeg?"+query, nil))
++		require.Equal(t, http.StatusNotFound, w.Code, query)
++		requireUnchanged(t, cam, dials)
++	}
++}
++
++func TestStreamRefusesSourceFromQuery(t *testing.T) {
++	cam, dials := configCam(t)
++
++	w := httptest.NewRecorder()
++	handlerStream(w, httptest.NewRequest("GET", "/api/stream.mjpeg?src=rtsp://192.0.2.1/x&name=cam", nil))
++	require.Equal(t, http.StatusNotFound, w.Code)
++	requireUnchanged(t, cam, dials)
++}
++
++func TestStreamRefusesPush(t *testing.T) {
++	cam, dials := configCam(t)
++
++	w := httptest.NewRecorder()
++	body := strings.NewReader("--frame\r\nContent-Type: image/jpeg\r\n\r\n")
++	handlerStream(w, httptest.NewRequest("POST", "/api/stream.mjpeg?dst=cam", body))
++	require.Equal(t, http.StatusForbidden, w.Code)
++	requireUnchanged(t, cam, dials)
++}
++
++func TestWSRefusesSourceFromQuery(t *testing.T) {
++	cam, dials := configCam(t)
++
++	tr := &ws.Transport{Request: httptest.NewRequest("GET", "/api/ws?src=rtsp://192.0.2.1/x&name=cam", nil)}
++	require.Error(t, handlerWS(tr, &ws.Message{Type: "mjpeg"}))
++	requireUnchanged(t, cam, dials)
++}
+diff --git a/internal/streams/no_api_source_test.go b/internal/streams/no_api_source_test.go
+new file mode 100644
+index 0000000..0a85082
+--- /dev/null
++++ b/internal/streams/no_api_source_test.go
+@@ -0,0 +1,76 @@
++package streams
++
++import (
++	"errors"
++	"net/url"
++	"sync"
++	"testing"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/stretchr/testify/require"
++)
++
++// configStreams replaces the streams with one config stream "cam" and a fake rtsp handler
++// that records every dial, and restores both after the test.
++func configStreams(t *testing.T) (*Stream, func() []string) {
++	savedStreams, savedHandler, hadHandler := streams, handlers["rtsp"], handlers["rtsp"] != nil
++	t.Cleanup(func() {
++		streams = savedStreams
++		if hadHandler {
++			handlers["rtsp"] = savedHandler
++		} else {
++			delete(handlers, "rtsp")
++		}
++	})
++
++	var mu sync.Mutex
++	var dials []string
++	HandleFunc("rtsp", func(source string) (core.Producer, error) {
++		mu.Lock()
++		dials = append(dials, source)
++		mu.Unlock()
++		return nil, errors.New("fake rtsp: no dial in tests")
++	})
++
++	cam := NewStream("rtsp://192.0.2.2/real")
++	streams = map[string]*Stream{"cam": cam}
++	return cam, func() []string {
++		mu.Lock()
++		defer mu.Unlock()
++		return append([]string(nil), dials...)
++	}
++}
++
++func TestGetOrPatchFindsConfigStream(t *testing.T) {
++	cam, _ := configStreams(t)
++
++	stream, err := GetOrPatch(url.Values{"src": {"cam"}})
++	require.NoError(t, err)
++	require.Same(t, cam, stream)
++}
++
++func TestGetOrPatchNeverCreatesOrPatches(t *testing.T) {
++	cam, dials := configStreams(t)
++
++	for _, raw := range []string{
++		"src=",
++		"src=rtsp://192.0.2.1/x",
++		"src=rtsp://192.0.2.1/x&name=cam",
++		"src=rtsp://192.0.2.1/x&name=new",
++		"src=ffmpeg:rtsp://192.0.2.1/x%23video=h264&name=cam",
++		"src=rtsp://127.0.0.1:8554/cam&name=alias",
++		"src=nope&name=cam",
++	} {
++		query, err := url.ParseQuery(raw)
++		require.NoError(t, err)
++
++		stream, err := GetOrPatch(query)
++		require.Error(t, err, raw)
++		require.Nil(t, stream, raw)
++
++		require.Equal(t, []string{"cam"}, GetAllNames(), raw)
++		require.Same(t, cam, streams["cam"], raw)
++		require.Equal(t, []string{"rtsp://192.0.2.2/real"}, cam.Sources(), raw)
++	}
++	require.Empty(t, dials())
++}
+diff --git a/internal/streams/streams.go b/internal/streams/streams.go
+index 2cf5b7a..cc68914 100644
+--- a/internal/streams/streams.go
++++ b/internal/streams/streams.go
+@@ -116,27 +116,28 @@ func Patch(name string, source string) (*Stream, error) {
+ 	return stream, nil
+ }
+ 
++// GetOrPatch only finds a stream that already exists, by the name in src. Upstream also
++// created a stream from a src URL, or set an existing stream's source from src with name=,
++// which let any client of the API (api/frame.jpeg, api/stream.mjpeg, api/stream.mp4,
++// api/stream.m3u8, api/ws) point a camera's stream at another producer or make go2rtc dial
++// any host. Here the streams come from the config only, and the query cannot change them.
+ func GetOrPatch(query url.Values) (*Stream, error) {
+-	// check if src param exists
+ 	source := query.Get("src")
+ 	if source == "" {
+ 		return nil, errors.New("streams: source empty")
+ 	}
+ 
+-	// check if src is stream name
+ 	if stream := Get(source); stream != nil {
+ 		return stream, nil
+ 	}
+ 
+-	// check if name param provided
+-	if name := query.Get("name"); name != "" {
+-		return Patch(name, source)
+-	}
+-
+-	// return new stream with src as name
+-	return Patch(source, source)
++	return nil, errors.New("streams: stream not found")
+ }
+ 
++// ErrPushDisabled answers a client that tries to add its own producer to a stream through
++// the HTTP or WebSocket API (dst=): a stream's producers come from the config only.
++var ErrPushDisabled = errors.New("streams: push to a stream is disabled")
++
+ var log zerolog.Logger
+ 
+ // streams map
+diff --git a/internal/webrtc/no_api_push_test.go b/internal/webrtc/no_api_push_test.go
+new file mode 100644
+index 0000000..5ae0ddb
+--- /dev/null
++++ b/internal/webrtc/no_api_push_test.go
+@@ -0,0 +1,83 @@
++package webrtc
++
++import (
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/AlexxIT/go2rtc/internal/api/ws"
++	"github.com/AlexxIT/go2rtc/internal/streams"
++	pion "github.com/pion/webrtc/v4"
++	"github.com/stretchr/testify/require"
++)
++
++// realPeerConnection makes PeerConnection a plain pion one for the test, as Init would.
++func realPeerConnection(t *testing.T) {
++	saved := PeerConnection
++	t.Cleanup(func() { PeerConnection = saved })
++	PeerConnection = func(bool) (*pion.PeerConnection, error) {
++		return pion.NewPeerConnection(pion.Configuration{})
++	}
++}
++
++// sendonlyOffer is what a client that wants to push video sends: one sendonly video track.
++func sendonlyOffer(t *testing.T) string {
++	pc, err := pion.NewPeerConnection(pion.Configuration{})
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = pc.Close() })
++	_, err = pc.AddTransceiverFromKind(pion.RTPCodecTypeVideo, pion.RTPTransceiverInit{Direction: pion.RTPTransceiverDirectionSendonly})
++	require.NoError(t, err)
++	offer, err := pc.CreateOffer(nil)
++	require.NoError(t, err)
++	return offer.SDP
++}
++
++func TestWHEPRefusesPush(t *testing.T) {
++	cam, dials := configCam(t)
++	realPeerConnection(t)
++	offer := sendonlyOffer(t)
++
++	for _, contentType := range []string{MimeSDP, "text/plain"} {
++		r := httptest.NewRequest("POST", "/api/webrtc?src=cam", strings.NewReader(offer))
++		r.Header.Set("Content-Type", contentType)
++		w := httptest.NewRecorder()
++		syncHandler(w, r)
++		require.Equal(t, http.StatusForbidden, w.Code, contentType)
++		requireUnchanged(t, cam, dials)
++	}
++}
++
++func TestExchangeSDPRefusesPush(t *testing.T) {
++	cam, dials := configCam(t)
++	realPeerConnection(t)
++
++	_, err := ExchangeSDP(cam, sendonlyOffer(t), "webrtc/whep", "")
++	require.ErrorIs(t, err, streams.ErrPushDisabled)
++	requireUnchanged(t, cam, dials)
++}
++
++func TestWSIgnoresClientICEServers(t *testing.T) {
++	cam, dials := configCam(t)
++
++	// The offer's ice_servers must never reach a PeerConnection: only the config's are used
++	fake := errors.New("fake: config PeerConnection")
++	calls := 0
++	saved := PeerConnection
++	t.Cleanup(func() { PeerConnection = saved })
++	PeerConnection = func(bool) (*pion.PeerConnection, error) {
++		calls++
++		return nil, fake
++	}
++
++	tr := &ws.Transport{Request: httptest.NewRequest("GET", "/api/ws?src=cam", nil)}
++	err := asyncHandler(tr, &ws.Message{Type: "webrtc", Value: map[string]any{
++		"type":        "offer",
++		"sdp":         "v=0",
++		"ice_servers": []map[string]any{{"urls": []string{"turn:192.0.2.1:3478"}, "username": "u", "credential": "p"}},
++	}})
++	require.ErrorIs(t, err, fake)
++	require.Equal(t, 1, calls)
++	requireUnchanged(t, cam, dials)
++}
+diff --git a/internal/webrtc/no_api_source_test.go b/internal/webrtc/no_api_source_test.go
+new file mode 100644
+index 0000000..5a73e9f
+--- /dev/null
++++ b/internal/webrtc/no_api_source_test.go
+@@ -0,0 +1,85 @@
++package webrtc
++
++import (
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/AlexxIT/go2rtc/internal/api/ws"
++	"github.com/AlexxIT/go2rtc/internal/streams"
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/stretchr/testify/require"
++)
++
++// configCam adds a config stream "cam" behind a fake rtsp handler that records every dial.
++func configCam(t *testing.T) (*streams.Stream, func() []string) {
++	var mu sync.Mutex
++	var dials []string
++	streams.HandleFunc("rtsp", func(source string) (core.Producer, error) {
++		mu.Lock()
++		dials = append(dials, source)
++		mu.Unlock()
++		return nil, errors.New("fake rtsp: no dial in tests")
++	})
++	cam, err := streams.New("cam", "rtsp://192.0.2.2/real")
++	require.NoError(t, err)
++	t.Cleanup(func() {
++		for _, name := range streams.GetAllNames() {
++			streams.Delete(name)
++		}
++	})
++	return cam, func() []string {
++		mu.Lock()
++		defer mu.Unlock()
++		return append([]string(nil), dials...)
++	}
++}
++
++func requireUnchanged(t *testing.T, cam *streams.Stream, dials func() []string) {
++	t.Helper()
++	require.Equal(t, []string{"cam"}, streams.GetAllNames())
++	require.Same(t, cam, streams.Get("cam"))
++	require.Equal(t, []string{"rtsp://192.0.2.2/real"}, cam.Sources())
++	require.Empty(t, dials())
++}
++
++func TestWSRefusesSourceFromQuery(t *testing.T) {
++	cam, dials := configCam(t)
++
++	for _, query := range []string{"src=rtsp://192.0.2.1/x&name=cam", "src=rtsp://192.0.2.1/x"} {
++		tr := &ws.Transport{Request: httptest.NewRequest("GET", "/api/ws?"+query, nil)}
++		err := asyncHandler(tr, &ws.Message{Type: "webrtc/offer", Value: "v=0"})
++		require.Error(t, err, query)
++		requireUnchanged(t, cam, dials)
++	}
++}
++
++func TestWSRefusesPush(t *testing.T) {
++	cam, dials := configCam(t)
++
++	tr := &ws.Transport{Request: httptest.NewRequest("GET", "/api/ws?dst=cam", nil)}
++	err := asyncHandler(tr, &ws.Message{Type: "webrtc/offer", Value: "v=0"})
++	require.ErrorIs(t, err, streams.ErrPushDisabled)
++	requireUnchanged(t, cam, dials)
++}
++
++func TestWHIPRefusesPush(t *testing.T) {
++	cam, dials := configCam(t)
++
++	w := httptest.NewRecorder()
++	syncHandler(w, httptest.NewRequest("POST", "/api/webrtc?dst=cam", strings.NewReader("v=0")))
++	require.Equal(t, http.StatusForbidden, w.Code)
++	requireUnchanged(t, cam, dials)
++}
++
++func TestWHEPRefusesSourceFromQuery(t *testing.T) {
++	cam, dials := configCam(t)
++
++	w := httptest.NewRecorder()
++	syncHandler(w, httptest.NewRequest("POST", "/api/webrtc?src=rtsp://192.0.2.1/x&name=cam", strings.NewReader("v=0")))
++	require.Equal(t, http.StatusNotFound, w.Code)
++	requireUnchanged(t, cam, dials)
++}
+diff --git a/internal/webrtc/server.go b/internal/webrtc/server.go
+index 48bd538..96d1aba 100644
+--- a/internal/webrtc/server.go
++++ b/internal/webrtc/server.go
+@@ -3,15 +3,13 @@ package webrtc
+ import (
+ 	"encoding/base64"
+ 	"encoding/json"
++	"errors"
+ 	"io"
+ 	"net/http"
+-	"strconv"
+ 	"strings"
+-	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/internal/api"
+ 	"github.com/AlexxIT/go2rtc/internal/streams"
+-	"github.com/AlexxIT/go2rtc/pkg/core"
+ 	"github.com/AlexxIT/go2rtc/pkg/webrtc"
+ 	pion "github.com/pion/webrtc/v4"
+ )
+@@ -125,6 +123,10 @@ func outputWebRTC(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	answer, err := ExchangeSDP(stream, offer, desc, r.UserAgent())
++	if errors.Is(err, streams.ErrPushDisabled) {
++		http.Error(w, err.Error(), http.StatusForbidden)
++		return
++	}
+ 	if err != nil {
+ 		log.Error().Err(err).Caller().Send()
+ 		http.Error(w, err.Error(), http.StatusInternalServerError)
+@@ -163,73 +165,8 @@ func outputWebRTC(w http.ResponseWriter, r *http.Request) {
+ 	}
+ }
+ 
+-func inputWebRTC(w http.ResponseWriter, r *http.Request) {
+-	dst := r.URL.Query().Get("dst")
+-	stream := streams.Get(dst)
+-	if stream == nil {
+-		http.Error(w, api.StreamNotFound, http.StatusNotFound)
+-		return
+-	}
+-
+-	// 1. Get offer
+-	offer, err := io.ReadAll(r.Body)
+-	if err != nil {
+-		log.Error().Err(err).Caller().Send()
+-		http.Error(w, err.Error(), http.StatusInternalServerError)
+-		return
+-	}
+-
+-	log.Trace().Msgf("[webrtc] WHIP offer\n%s", offer)
+-
+-	pc, err := PeerConnection(false)
+-	if err != nil {
+-		log.Error().Err(err).Caller().Send()
+-		http.Error(w, err.Error(), http.StatusInternalServerError)
+-		return
+-	}
+-
+-	// create new webrtc instance
+-	prod := webrtc.NewConn(pc)
+-	prod.Mode = core.ModePassiveProducer
+-	prod.Protocol = "http"
+-	prod.UserAgent = r.UserAgent()
+-
+-	if err = prod.SetOffer(string(offer)); err != nil {
+-		log.Warn().Err(err).Caller().Send()
+-		http.Error(w, err.Error(), http.StatusInternalServerError)
+-		return
+-	}
+-
+-	answer, err := prod.GetCompleteAnswer(GetCandidates(), FilterCandidate)
+-	if err != nil {
+-		log.Warn().Err(err).Caller().Send()
+-		http.Error(w, err.Error(), http.StatusInternalServerError)
+-		return
+-	}
+-
+-	log.Trace().Msgf("[webrtc] WHIP answer\n%s", answer)
+-
+-	id := strconv.FormatInt(time.Now().UnixNano(), 36)
+-	sessions[id] = prod
+-
+-	prod.Listen(func(msg any) {
+-		switch msg := msg.(type) {
+-		case pion.PeerConnectionState:
+-			if msg == pion.PeerConnectionStateClosed {
+-				stream.RemoveProducer(prod)
+-				delete(sessions, id)
+-			}
+-		}
+-	})
+-
+-	stream.AddProducer(prod)
+-
+-	w.Header().Set("Content-Type", MimeSDP)
+-	w.Header().Set("Location", "webrtc?id="+id)
+-	w.WriteHeader(http.StatusCreated)
+-
+-	if _, err = w.Write([]byte(answer)); err != nil {
+-		log.Warn().Err(err).Caller().Send()
+-		return
+-	}
++// inputWebRTC refuses upstream's WHIP push (POST ?dst=): a client may not add its own
++// producer to a stream, whose producers come from the config only.
++func inputWebRTC(w http.ResponseWriter, _ *http.Request) {
++	http.Error(w, streams.ErrPushDisabled.Error(), http.StatusForbidden)
+ }
+diff --git a/internal/webrtc/webrtc.go b/internal/webrtc/webrtc.go
+index 2a5b4ad..7947e95 100644
+--- a/internal/webrtc/webrtc.go
++++ b/internal/webrtc/webrtc.go
+@@ -123,20 +123,20 @@ func asyncHandler(tr *ws.Transport, msg *ws.Message) (err error) {
+ 		stream, _ = streams.GetOrPatch(query)
+ 		mode = core.ModePassiveConsumer
+ 		log.Debug().Str("src", name).Msg("[webrtc] new consumer")
+-	} else if name = query.Get("dst"); name != "" {
+-		stream = streams.Get(name)
+-		mode = core.ModePassiveProducer
+-		log.Debug().Str("src", name).Msg("[webrtc] new producer")
++	} else if query.Get("dst") != "" {
++		// A client may not add its own producer to a stream (upstream's dst= push)
++		return streams.ErrPushDisabled
+ 	}
+ 
+ 	if stream == nil {
+ 		return errors.New(api.StreamNotFound)
+ 	}
+ 
++	// The offer's own ice_servers (upstream's json field) are not read: a client could make
++	// go2rtc send STUN or TURN to any host. Only the config's ICE servers are used.
+ 	var offer struct {
+-		Type       string           `json:"type"`
+-		SDP        string           `json:"sdp"`
+-		ICEServers []pion.ICEServer `json:"ice_servers"`
++		Type string `json:"type"`
++		SDP  string `json:"sdp"`
+ 	}
+ 
+ 	// V2 - json/object exchange, V1 - raw SDP exchange
+@@ -151,12 +151,7 @@ func asyncHandler(tr *ws.Transport, msg *ws.Message) (err error) {
+ 	}
+ 
+ 	// create new PeerConnection instance
+-	var pc *pion.PeerConnection
+-	if offer.ICEServers == nil {
+-		pc, err = PeerConnection(false)
+-	} else {
+-		pc, err = serverAPI.NewPeerConnection(pion.Configuration{ICEServers: offer.ICEServers})
+-	}
++	pc, err := PeerConnection(false)
+ 	if err != nil {
+ 		log.Error().Err(err).Caller().Send()
+ 		return err
+@@ -283,9 +278,10 @@ func ExchangeSDP(stream *streams.Stream, offer, desc, userAgent string) (answer
+ 			return
+ 		}
+ 	} else {
+-		conn.Mode = core.ModePassiveProducer
+-
+-		stream.AddProducer(conn)
++		// A client that offers to send video would become a producer of the stream
++		// (upstream's push through WHEP, POST ?src=): refused, like the dst= pushes.
++		_ = conn.Close()
++		return "", streams.ErrPushDisabled
+ 	}
+ 
+ 	answer, err = conn.GetCompleteAnswer(GetCandidates(), FilterCandidate)

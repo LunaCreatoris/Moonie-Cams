@@ -1,0 +1,9 @@
+line-length = 120
+target-version = "py313"
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[lint.isort]
+# Modules of this repository, imported by the tests as top-level modules
+known-first-party = ["app", "onvif_proxy", "fake_tapo", "sentinel", "test_proxy", "webhook"]

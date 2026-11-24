@@ -1,0 +1,19 @@
+# Added to the rendered .copy-check/out/compose.yml by `just copy-check`; paths are relative to
+# that folder. A test source that streams ffmpeg's testsrc, and a checker that plays the clients.
+services:
+  source:
+    image: alexxit/go2rtc:1.9.15@sha256:e098de5c2f8040dc3d4784ed2d5cfdac3b0979f9349afe587ef6a670a14b9f4d
+    command:
+      - go2rtc
+      - -config
+      - >-
+        {"api": {"listen": ":1984"}, "rtsp": {"listen": ":8554"}, "log": {"format": "text"},
+        "streams": {"src": "exec:ffmpeg -hide_banner -re -f lavfi -i testsrc=size=640x360:rate=10
+        -c:v libx264 -preset ultrafast -tune zerolatency -g 20 -pix_fmt yuv420p -f rtsp {output}"}}
+  checker:
+    image: alexxit/go2rtc:1.9.15@sha256:e098de5c2f8040dc3d4784ed2d5cfdac3b0979f9349afe587ef6a670a14b9f4d
+    depends_on: [source, cam-copycheck]
+    volumes:
+      - ../..:/work:ro
+    working_dir: /work
+    command: ["python3", "tests/copy_check/check.py"]

@@ -1,0 +1,85 @@
+# `just mirror-check`: a copy must go dark while its source camera is down (a client connection
+# opened before that included), come back with it, and keep doing so after go2rtc restarts into a
+# new network namespace. The source is given by name, resolved through a DNS server on the test
+# network, whose answers must still reach a closed copy. When go2rtc stays down longer than the
+# sentinel's own restart (about 15 s: `docker compose stop cam-x`, later `start cam-x`), Docker
+# cannot join the stopped namespace and the sentinel stays exited, as no restart policy or
+# depends_on setting brings it back on a plain `start`; `docker compose up -d` (`just up`) does, and
+# the check proves it. Every address is in TEST-NET-2 (documentation only), and the network is
+# internal: nothing on the LAN is ever reached.
+name: moonie-cams-mirror
+
+x-python: &python
+  # Same pinned base as sentinel/Dockerfile
+  image: python:3.13.18-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+  environment:
+    PYTHONDONTWRITEBYTECODE: "1"
+  volumes:
+    - ./:/check:ro
+
+networks:
+  test:
+    internal: true
+    ipam:
+      config:
+        # Clients get addresses from the upper half only, so one never takes the stopped camera's
+        - subnet: 198.51.100.0/24
+          ip_range: 198.51.100.128/25
+
+services:
+  # The real camera: anything listening on its RTSP port
+  camera:
+    <<: *python
+    command: ["python", "/check/listener.py", "camera"]
+    networks:
+      test:
+        ipv4_address: 198.51.100.10
+
+  # The LAN's DNS server: the source is given by name, and the answer to the copy's lookup comes
+  # back on the copy's own interface, as a reply to a flow the copy opened
+  dns:
+    <<: *python
+    command: ["python", "/check/dns.py", "camera.mirror.test", "198.51.100.10"]
+    networks:
+      test:
+        ipv4_address: 198.51.100.53
+
+  # Stands in for the go2rtc copy: answers on 554, and is the namespace the sentinel joins
+  cam:
+    <<: *python
+    restart: unless-stopped
+    command: ["python", "/check/listener.py", "copy"]
+    dns: [198.51.100.53]
+    depends_on: [dns]
+    networks:
+      test:
+        ipv4_address: 198.51.100.20
+
+  cam-mirror:
+    build: ../../sentinel
+    image: moonie-cams-sentinel:check
+    restart: unless-stopped
+    network_mode: service:cam
+    depends_on: [cam]
+    # Same hardening as the rendered compose (app.py mirror_service): this check proves it runs so
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      MIRROR_HOST: camera.mirror.test
+      MIRROR_PORT: "554"
+      WATCH_PORT: "554"
+
+  client:
+    <<: *python
+    profiles: [client]
+    entrypoint: ["python", "/check/client.py"]
+    networks: [test]
+
+  # One client that holds an established connection across the copy closing
+  held:
+    <<: *python
+    profiles: [client]
+    command: ["python", "/check/client.py", "held", "90"]
+    networks: [test]

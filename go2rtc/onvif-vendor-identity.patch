@@ -1,0 +1,283 @@
+ONVIF device identity from the environment for go2rtc v1.9.15 (7c05066), applied after
+onvif-profile.patch (it changes lines next to that patch's). Upstream announces itself as
+go2rtc to every client: GetDeviceInformation answers Model go2rtc with no Manufacturer, and
+GetScopes holds onvif://www.onvif.org/name/go2rtc and location/github, so UniFi Protect named
+every copy "go2rtc". ONVIF_NAME, ONVIF_MANUFACTURER and ONVIF_MODEL replace those values when
+set and not empty; ONVIF_LOCATION replaces the location, and set to "" drops that scope. Scope
+values are URL-escaped (url.PathEscape), and every GetDeviceInformation field is XML-escaped,
+the SerialNumber included: it is the request's Host header, which upstream pasted as is. The
+SerialNumber itself stays upstream's (the address the client reached, unique per copy, which
+Home Assistant needs). Without the env vars, both answers keep upstream's values (GetScopes
+byte for byte). Comes with its own tests (go test ./pkg/onvif/ ./internal/onvif/).
+
+diff --git a/internal/onvif/identity_test.go b/internal/onvif/identity_test.go
+new file mode 100644
+index 0000000..cd24d79
+--- /dev/null
++++ b/internal/onvif/identity_test.go
+@@ -0,0 +1,38 @@
++package onvif
++
++import (
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/AlexxIT/go2rtc/pkg/onvif"
++	"github.com/stretchr/testify/require"
++)
++
++func deviceRequest(action string) string {
++	return `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>` +
++		`<tds:` + action + ` xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/></s:Body></s:Envelope>`
++}
++
++func TestDeviceServiceAnnouncesTheIdentity(t *testing.T) {
++	saved := onvif.DeviceIdentity
++	t.Cleanup(func() { onvif.DeviceIdentity = saved })
++	onvif.DeviceIdentity = onvif.Identity{Name: "Front & co", Manufacturer: "Moonie-Cams", Model: "Cams"}
++
++	w := httptest.NewRecorder()
++	r := httptest.NewRequest("POST", "/onvif/device_service", strings.NewReader(deviceRequest("GetDeviceInformation")))
++	r.Host = "192.0.2.10"
++	onvifDeviceService(w, r)
++	body := w.Body.String()
++	require.Contains(t, body, "<tds:Manufacturer>Moonie-Cams</tds:Manufacturer>")
++	require.Contains(t, body, "<tds:Model>Cams</tds:Model>")
++	// The serial stays upstream's: the address the client reached, unique per copy
++	require.Contains(t, body, "<tds:SerialNumber>192.0.2.10</tds:SerialNumber>")
++
++	w = httptest.NewRecorder()
++	onvifDeviceService(w, httptest.NewRequest("POST", "/onvif/device_service", strings.NewReader(deviceRequest("GetScopes"))))
++	body = w.Body.String()
++	require.Contains(t, body, "<tt:ScopeItem>onvif://www.onvif.org/name/Front%20&amp;%20co</tt:ScopeItem>")
++	require.NotContains(t, body, "/name/go2rtc")
++	require.NotContains(t, body, "/location/")
++}
+diff --git a/internal/onvif/onvif.go b/internal/onvif/onvif.go
+index 7e237fd..05656bf 100644
+--- a/internal/onvif/onvif.go
++++ b/internal/onvif/onvif.go
+@@ -127,7 +127,7 @@ func onvifDeviceService(w http.ResponseWriter, r *http.Request) {
+ 
+ 	case onvif.DeviceGetDeviceInformation:
+ 		// important for Hass: SerialNumber (unique server ID)
+-		b = onvif.GetDeviceInformationResponse("", "go2rtc", app.Version, r.Host)
++		b = onvif.GetDeviceInformationResponse(onvif.DeviceIdentity.Manufacturer, onvif.DeviceIdentity.Model, app.Version, r.Host)
+ 
+ 	case onvif.DeviceSystemReboot:
+ 		// Upstream answered OK and exited a second later, unauthenticated: any host on the
+diff --git a/pkg/onvif/identity_test.go b/pkg/onvif/identity_test.go
+new file mode 100644
+index 0000000..ca8d11c
+--- /dev/null
++++ b/pkg/onvif/identity_test.go
+@@ -0,0 +1,110 @@
++package onvif
++
++import (
++	"encoding/xml"
++	"net/url"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// upstreamScopes is go2rtc v1.9.15's fixed GetScopes answer, which the defaults must keep.
++const upstreamScopes = `<tds:GetScopesResponse>
++	<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/name/go2rtc</tt:ScopeItem></tds:Scopes>
++	<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/location/github</tt:ScopeItem></tds:Scopes>
++	<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/Profile/Streaming</tt:ScopeItem></tds:Scopes>
++	<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/type/Network_Video_Transmitter</tt:ScopeItem></tds:Scopes>
++</tds:GetScopesResponse>`
++
++func env(values map[string]string) func(string) (string, bool) {
++	return func(key string) (string, bool) {
++		v, ok := values[key]
++		return v, ok
++	}
++}
++
++// scopeItems parses a GetScopes answer and returns its ScopeItem values, unescaped from XML.
++func scopeItems(t *testing.T, b []byte) []string {
++	var doc struct {
++		Items []string `xml:"Body>GetScopesResponse>Scopes>ScopeItem"`
++	}
++	require.NoError(t, xml.Unmarshal(b, &doc))
++	return doc.Items
++}
++
++type deviceInformation struct {
++	Manufacturer, Model, FirmwareVersion, SerialNumber string
++}
++
++func parseDeviceInformation(t *testing.T, b []byte) deviceInformation {
++	var doc struct {
++		Info deviceInformation `xml:"Body>GetDeviceInformationResponse"`
++	}
++	require.NoError(t, xml.Unmarshal(b, &doc))
++	return doc.Info
++}
++
++func TestIdentityDefaultsAreUpstreams(t *testing.T) {
++	id := IdentityFromEnv(env(nil))
++	require.Equal(t, Identity{Name: "go2rtc", Manufacturer: "", Model: "go2rtc", Location: "github"}, id)
++
++	want := NewEnvelope()
++	want.Append(upstreamScopes)
++	require.Equal(t, string(want.Bytes()), string(GetScopesResponse(id)))
++	// Empty values are not an identity: upstream's stays
++	empty := map[string]string{"ONVIF_NAME": "", "ONVIF_MANUFACTURER": "", "ONVIF_MODEL": ""}
++	require.Equal(t, id, IdentityFromEnv(env(empty)))
++}
++
++func TestIdentityFromEnv(t *testing.T) {
++	id := IdentityFromEnv(env(map[string]string{
++		"ONVIF_NAME":         "Front",
++		"ONVIF_MANUFACTURER": "Moonie-Cams",
++		"ONVIF_MODEL":        "Cams",
++		"ONVIF_LOCATION":     "Porch",
++	}))
++	require.Equal(t, Identity{Name: "Front", Manufacturer: "Moonie-Cams", Model: "Cams", Location: "Porch"}, id)
++	require.Equal(t, []string{
++		"onvif://www.onvif.org/name/Front",
++		"onvif://www.onvif.org/location/Porch",
++		"onvif://www.onvif.org/Profile/Streaming",
++		"onvif://www.onvif.org/type/Network_Video_Transmitter",
++	}, scopeItems(t, GetScopesResponse(id)))
++
++	info := parseDeviceInformation(t, GetDeviceInformationResponse(id.Manufacturer, id.Model, "1.9.15", "192.0.2.10"))
++	require.Equal(t, deviceInformation{"Moonie-Cams", "Cams", "1.9.15", "192.0.2.10"}, info)
++}
++
++func TestEmptyLocationDropsTheScope(t *testing.T) {
++	id := IdentityFromEnv(env(map[string]string{"ONVIF_NAME": "Front", "ONVIF_LOCATION": ""}))
++	require.Equal(t, "", id.Location)
++	require.Equal(t, []string{
++		"onvif://www.onvif.org/name/Front",
++		"onvif://www.onvif.org/Profile/Streaming",
++		"onvif://www.onvif.org/type/Network_Video_Transmitter",
++	}, scopeItems(t, GetScopesResponse(id)))
++}
++
++func TestScopeValuesAreURLEscaped(t *testing.T) {
++	name := `Hall & Co <1>/2 "Zone Ω" #3?`
++	location := "Ground floor / Unit Ü"
++	items := scopeItems(t, GetScopesResponse(Identity{Name: name, Location: location}))
++	require.Len(t, items, 4)
++	for i, prefix := range []string{"onvif://www.onvif.org/name/", "onvif://www.onvif.org/location/"} {
++		require.Regexp(t, `^`+prefix+`[A-Za-z0-9%._~!$&'()*+,;=:@-]+$`, items[i])
++		value, err := url.PathUnescape(items[i][len(prefix):])
++		require.NoError(t, err)
++		require.Equal(t, []string{name, location}[i], value)
++	}
++	// A space is %20, never a raw space, which would split the scope list
++	require.Contains(t, items[0], "Hall%20&%20Co")
++}
++
++func TestDeviceInformationIsXMLEscaped(t *testing.T) {
++	// The serial is the request's Host header: a client must not inject markup through it
++	serial := `x</tds:SerialNumber><tds:Injected>1</tds:Injected><tds:SerialNumber>y`
++	b := GetDeviceInformationResponse(`A&B "Co"`, "<Cams>", "1.9.15", serial)
++	require.NotContains(t, string(b), "<tds:Injected>")
++	info := parseDeviceInformation(t, b)
++	require.Equal(t, deviceInformation{`A&B "Co"`, "<Cams>", "1.9.15", serial}, info)
++}
+diff --git a/pkg/onvif/server.go b/pkg/onvif/server.go
+index 394fe02..9d5aaed 100644
+--- a/pkg/onvif/server.go
++++ b/pkg/onvif/server.go
+@@ -2,12 +2,62 @@ package onvif
+ 
+ import (
+ 	"bytes"
++	"encoding/xml"
++	"net/url"
+ 	"os"
+ 	"regexp"
+ 	"strconv"
++	"strings"
+ 	"time"
+ )
+ 
++// Identity is what the ONVIF server announces in GetDeviceInformation and GetScopes.
++// An empty Location drops the location scope.
++type Identity struct {
++	Name, Manufacturer, Model, Location string
++}
++
++// DeviceIdentity comes from ONVIF_NAME, ONVIF_MANUFACTURER, ONVIF_MODEL and ONVIF_LOCATION.
++var DeviceIdentity = IdentityFromEnv(os.LookupEnv)
++
++// IdentityFromEnv reads the identity; an unset or empty value keeps upstream's, except
++// ONVIF_LOCATION, which set to "" drops the location scope.
++func IdentityFromEnv(lookup func(string) (string, bool)) Identity {
++	id := Identity{Name: "go2rtc", Manufacturer: "", Model: "go2rtc", Location: "github"}
++	for key, field := range map[string]*string{"ONVIF_NAME": &id.Name, "ONVIF_MANUFACTURER": &id.Manufacturer, "ONVIF_MODEL": &id.Model} {
++		if v, ok := lookup(key); ok && v != "" {
++			*field = v
++		}
++	}
++	if v, ok := lookup("ONVIF_LOCATION"); ok {
++		id.Location = v
++	}
++	return id
++}
++
++// xmlText escapes s for XML text; characters XML cannot hold become U+FFFD.
++func xmlText(s string) string {
++	var b strings.Builder
++	_ = xml.EscapeText(&b, []byte(s))
++	return b.String()
++}
++
++// GetScopesResponse lists the fixed scopes, the name and location URL-escaped.
++func GetScopesResponse(id Identity) []byte {
++	items := []string{"onvif://www.onvif.org/name/" + url.PathEscape(id.Name)}
++	if id.Location != "" {
++		items = append(items, "onvif://www.onvif.org/location/"+url.PathEscape(id.Location))
++	}
++	items = append(items, "onvif://www.onvif.org/Profile/Streaming", "onvif://www.onvif.org/type/Network_Video_Transmitter")
++	e := NewEnvelope()
++	e.Append("<tds:GetScopesResponse>\n")
++	for _, item := range items {
++		e.Appendf("\t<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>%s</tt:ScopeItem></tds:Scopes>\n", xmlText(item))
++	}
++	e.Append("</tds:GetScopesResponse>")
++	return e.Bytes()
++}
++
+ // Advertised video profile: the live stream's size and frame rate when LiveVideo finds
+ // them, else the ONVIF_* environment variables (positive integers), else go2rtc's
+ // defaults. The bitrate (kbit/s) has no live source.
+@@ -166,7 +216,7 @@ func GetDeviceInformationResponse(manuf, model, firmware, serial string) []byte
+ 	<tds:FirmwareVersion>%s</tds:FirmwareVersion>
+ 	<tds:SerialNumber>%s</tds:SerialNumber>
+ 	<tds:HardwareId>1.00</tds:HardwareId>
+-</tds:GetDeviceInformationResponse>`, manuf, model, firmware, serial)
++</tds:GetDeviceInformationResponse>`, xmlText(manuf), xmlText(model), xmlText(firmware), xmlText(serial))
+ 	return e.Bytes()
+ }
+ 
+@@ -302,6 +352,8 @@ func StaticResponse(operation string) []byte {
+ 		return GetVideoEncoderConfigurationResponse()
+ 	case MediaGetVideoEncoderConfigurations:
+ 		return GetVideoEncoderConfigurationsResponse()
++	case DeviceGetScopes:
++		return GetScopesResponse(DeviceIdentity)
+ 	}
+ 
+ 	e := NewEnvelope()
+@@ -326,12 +378,6 @@ var responses = map[string]string{
+ 
+ 	DeviceGetNetworkInterfaces: `<tds:GetNetworkInterfacesResponse />`,
+ 	DeviceGetNetworkProtocols:  `<tds:GetNetworkProtocolsResponse />`,
+-	DeviceGetScopes: `<tds:GetScopesResponse>
+-	<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/name/go2rtc</tt:ScopeItem></tds:Scopes>
+-	<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/location/github</tt:ScopeItem></tds:Scopes>
+-	<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/Profile/Streaming</tt:ScopeItem></tds:Scopes>
+-	<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/type/Network_Video_Transmitter</tt:ScopeItem></tds:Scopes>
+-</tds:GetScopesResponse>`,
+ 
+ 	MediaGetAudioEncoderConfigurations: `<trt:GetAudioEncoderConfigurationsResponse />`,
+ 	MediaGetAudioSources:               `<trt:GetAudioSourcesResponse />`,

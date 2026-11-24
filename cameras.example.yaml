@@ -1,0 +1,71 @@
+# Copy to cameras.yaml (git-ignored), then run `just render`.
+#
+# One entry per camera; each one becomes its own go2rtc container.
+#   name        lowercase letters, digits and _; also the stream path (rtsp://<ip>/<name>)
+#   input       format of the source: rtsp | onvif | rtmp | hls | mjpeg
+#   source      URL go2rtc reads; write a password as ${KEY}, its value goes in secrets/KEY
+#   source_sub  optional second, smaller stream (a second ONVIF profile)
+#   outputs     formats served: onvif | rtsp | rtmp | hls | webrtc | mjpeg (never the input format,
+#               unless mode is copy)
+#   ip          address of the copy on the LAN; needed for onvif and webrtc
+#   mac         optional; a stable one is derived from the name
+#   output_user username of the copy's RTSP account (default cams); its password goes in
+#               secrets/<NAME>_OUTPUT_PASSWORD
+#   rtmp_target URL to push to, for the rtmp output
+#   ports       host ports {http, rtsp} for a camera without an ip
+#   fps         optional, 1-60; H.264 encoder frame rate when transcoded (default 10), and advertised
+#   bitrate     optional, kbit/s; H.264 encoder cap when transcoded (default 600), and advertised
+#   size        optional WIDTHxHEIGHT advertised over ONVIF while the stream is not running
+#               (the running stream's own size always wins)
+#   location    optional, announced over ONVIF (printable, at most 64 characters; onvif output,
+#               not mode proxy). The ONVIF name is always the container's, cams-<name>
+#   mode        optional, one of:
+#               copy: every output is a separate copy of the one source connection (see README)
+#               proxy: relays the camera's own ONVIF (PTZ, events, imaging) through the copy;
+#               needs input rtsp, the onvif output and onvif_url (see README)
+#               copy and proxy do not combine
+#   onvif_url   the real camera's ONVIF address, for mode proxy: http://<IPv4>[:port] only
+#               (a Tapo: http://<ip>:2020)
+#   ptz_hold    seconds PTZ stays with the client that moved it last (mode proxy, default 5,
+#               above 0, at most 600)
+#   proxy_log   what the proxy logs per request (mode proxy): all, writes (the default) or off
+#   mirror_state optional, default true: the copy goes dark while its source is down (see README);
+#               false keeps it up
+
+cameras:
+  # Tapo C100: RTSP in, ONVIF (with its RTSP) out for UniFi Protect, plus MJPEG for a browser.
+  - name: c100
+    input: rtsp
+    source: rtsp://cams:${C100_SOURCE_PASSWORD}@192.0.2.12:554/stream1
+    source_sub: rtsp://cams:${C100_SOURCE_PASSWORD}@192.0.2.12:554/stream2
+    outputs: [onvif, mjpeg]
+    ip: CHANGE_ME
+    location: Entrance
+
+  # Tapo C210 (pan-tilt): same streams as the C100, and its own ONVIF (PTZ, events) relayed
+  # by the proxy. Protect and Home Assistant give the copy the Tapo camera account.
+  - name: c210_a
+    input: rtsp
+    source: rtsp://cams:${C210_A_SOURCE_PASSWORD}@192.0.2.10:554/stream1
+    source_sub: rtsp://cams:${C210_A_SOURCE_PASSWORD}@192.0.2.10:554/stream2
+    outputs: [onvif, mjpeg]
+    ip: CHANGE_ME
+    mode: proxy
+    onvif_url: http://192.0.2.10:2020
+
+  # ESP32-CAM: MJPEG in, ONVIF out (go2rtc transcodes to H.264 with ffmpeg).
+  - name: esp32
+    input: mjpeg
+    source: http://CHANGE_ME:81/stream
+    outputs: [onvif, hls]
+    ip: CHANGE_ME
+    fps: 10
+    bitrate: 600
+    size: 800x600
+
+  # OctoPrint webcam: MJPEG in, ONVIF out, behind OctoPrint's own URL.
+  - name: octoprint
+    input: mjpeg
+    source: http://CHANGE_ME/webcam/?action=stream
+    outputs: [onvif]
+    ip: CHANGE_ME

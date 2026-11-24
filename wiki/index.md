@@ -1,0 +1,4 @@
+# Wiki of moonie-cams
+
+- [Guide en français](guide/fr/index.md)
+- [Guide in English](guide/en/index.md)

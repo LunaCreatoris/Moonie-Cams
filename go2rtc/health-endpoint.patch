@@ -1,0 +1,271 @@
+Read-only GET /api/health for go2rtc v1.9.15 (7c05066), used by the copy mode of app.py.
+Per stream: each producer's state and counters, each consumer's format, counters and drops,
+and whether the consumer is on loopback. No url, source, remote address or user agent, and any
+method but GET gets 405, so it can be allowed on a public listener (unlike /api/streams, which
+shows sources and accepts PUT/PATCH/POST). It never waits on a producer that is dialing: that
+producer is reported "busy", so a healthcheck cannot time out on a slow camera. Comes with its
+own tests (go test -run TestHealth).
+
+diff --git a/internal/streams/health.go b/internal/streams/health.go
+new file mode 100644
+index 0000000..fd23160
+--- /dev/null
++++ b/internal/streams/health.go
+@@ -0,0 +1,135 @@
++package streams
++
++import (
++	"encoding/json"
++	"net/http"
++	"strings"
++
++	"github.com/AlexxIT/go2rtc/internal/api"
++	"github.com/AlexxIT/go2rtc/pkg/core"
++)
++
++// GET api/health: the state and counters of every stream, and nothing else.
++// Unlike api/streams it never shows a url, a source or a remote address, and it is read-only,
++// so it can be allowed on a public listener.
++
++type healthStream struct {
++	Producers []healthConn `json:"producers"`
++	Consumers []healthConn `json:"consumers"`
++}
++
++type healthConn struct {
++	State      string `json:"state,omitempty"`
++	FormatName string `json:"format_name,omitempty"`
++	Protocol   string `json:"protocol,omitempty"`
++	BytesRecv  int    `json:"bytes_recv"`
++	BytesSend  int    `json:"bytes_send"`
++	Packets    int    `json:"packets"`
++	Drops      int    `json:"drops"`
++	// Internal marks a peer on loopback (go2rtc's own ffmpeg reading a stream back), so a
++	// client count can leave it out without the address being shown.
++	Internal bool `json:"internal,omitempty"`
++}
++
++// healthFields is the allow-list read back from a connection's own JSON: anything else it
++// carries (url, source, remote_addr, user_agent, sdp, medias) is dropped by the decoder.
++type healthFields struct {
++	FormatName string `json:"format_name"`
++	Protocol   string `json:"protocol"`
++	RemoteAddr string `json:"remote_addr"`
++	BytesRecv  int    `json:"bytes_recv"`
++	BytesSend  int    `json:"bytes_send"`
++	Receivers  []struct {
++		Bytes   int `json:"bytes"`
++		Packets int `json:"packets"`
++	} `json:"receivers"`
++	Senders []struct {
++		Bytes   int `json:"bytes"`
++		Packets int `json:"packets"`
++		Drops   int `json:"drops"`
++	} `json:"senders"`
++}
++
++var stateNames = map[state]string{
++	stateNone:     "idle",
++	stateMedias:   "dialed",
++	stateTracks:   "dialed",
++	stateStart:    "running",
++	stateExternal: "external",
++	stateInternal: "internal",
++}
++
++func healthOf(v any) healthConn {
++	var f healthFields
++	if b, err := json.Marshal(v); err == nil {
++		_ = json.Unmarshal(b, &f)
++	}
++	h := healthConn{FormatName: f.FormatName, Protocol: f.Protocol, BytesRecv: f.BytesRecv, BytesSend: f.BytesSend}
++	h.Internal = strings.HasPrefix(f.RemoteAddr, "127.") || strings.HasPrefix(f.RemoteAddr, "[::1]")
++	// Some connections never update their own byte counter (the RTSP server adds to it only
++	// when a write fails), so fall back to what their tracks counted.
++	var recv, send int
++	for _, r := range f.Receivers {
++		recv += r.Bytes
++		h.Packets += r.Packets
++	}
++	for _, s := range f.Senders {
++		send += s.Bytes
++		h.Packets += s.Packets
++		h.Drops += s.Drops
++	}
++	h.BytesRecv = max(h.BytesRecv, recv)
++	h.BytesSend = max(h.BytesSend, send)
++	return h
++}
++
++func (s *Stream) health() healthStream {
++	s.mu.Lock()
++	producers := append([]*Producer(nil), s.producers...)
++	consumers := append([]core.Consumer(nil), s.consumers...)
++	s.mu.Unlock()
++
++	h := healthStream{Producers: []healthConn{}, Consumers: []healthConn{}}
++	for _, prod := range producers {
++		// Dial holds the producer's lock while the camera answers: report it busy rather
++		// than wait, so the healthcheck never times out on a slow camera.
++		if !prod.mu.TryLock() {
++			h.Producers = append(h.Producers, healthConn{State: "busy"})
++			continue
++		}
++		st, conn := prod.state, prod.conn
++		prod.mu.Unlock()
++		var c healthConn
++		if conn != nil {
++			c = healthOf(conn)
++		}
++		c.State = stateNames[st]
++		h.Producers = append(h.Producers, c)
++	}
++	for _, cons := range consumers {
++		h.Consumers = append(h.Consumers, healthOf(cons))
++	}
++	return h
++}
++
++func apiHealth(w http.ResponseWriter, r *http.Request) {
++	if r.Method != "GET" {
++		w.Header().Set("Allow", "GET")
++		http.Error(w, "", http.StatusMethodNotAllowed)
++		return
++	}
++
++	streamsMu.Lock()
++	all := make(map[string]*Stream, len(streams))
++	for name, stream := range streams {
++		all[name] = stream
++	}
++	streamsMu.Unlock()
++
++	// encoding/json writes map keys sorted, so the answer is stable.
++	info := make(map[string]healthStream, len(all))
++	for name, stream := range all {
++		info[name] = stream.health()
++	}
++	api.ResponseJSON(w, info)
++}
+diff --git a/internal/streams/health_test.go b/internal/streams/health_test.go
+new file mode 100644
+index 0000000..26364db
+--- /dev/null
++++ b/internal/streams/health_test.go
+@@ -0,0 +1,104 @@
++package streams
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/stretchr/testify/require"
++)
++
++type healthFake struct {
++	core.Connection
++}
++
++func (f *healthFake) Start() error { return nil }
++
++func (f *healthFake) AddTrack(*core.Media, *core.Codec, *core.Receiver) error { return nil }
++
++func TestHealthShowsCountersOnly(t *testing.T) {
++	saved := streams
++	t.Cleanup(func() { streams = saved })
++	streams = map[string]*Stream{}
++	stream := NewStream(nil)
++	streams["cam"] = stream
++
++	prod := &healthFake{core.Connection{
++		FormatName: "rtsp", Protocol: "rtsp", URL: "rtsp://user:hunter2@192.0.2.2/s1",
++		Source: "rtsp://user:hunter2@192.0.2.2/s1", RemoteAddr: "192.0.2.2:554", Recv: 1000,
++	}}
++	stream.AddProducer(prod)
++
++	cons := &healthFake{core.Connection{
++		FormatName: "mjpeg", Protocol: "http", RemoteAddr: "203.0.113.9:51000", UserAgent: "Firefox",
++		URL: "/api/stream.mjpeg?src=cam", Send: 500,
++	}}
++	sender := core.NewSender(&core.Media{Kind: core.KindVideo}, &core.Codec{Name: core.CodecJPEG})
++	sender.Drops = 3
++	cons.Senders = []*core.Sender{sender}
++	internal := &healthFake{core.Connection{FormatName: "rtsp", Protocol: "rtsp+tcp", RemoteAddr: "127.0.0.1:40000"}}
++	// The RTSP server leaves its own Send at 0; its senders count the bytes.
++	rtspSender := core.NewSender(&core.Media{Kind: core.KindVideo}, &core.Codec{Name: core.CodecH264})
++	rtspSender.Bytes, rtspSender.Packets = 7, 2
++	internal.Senders = []*core.Sender{rtspSender}
++	stream.consumers = append(stream.consumers, cons, internal)
++
++	w := httptest.NewRecorder()
++	apiHealth(w, httptest.NewRequest("GET", "/api/health", nil))
++	require.Equal(t, http.StatusOK, w.Code)
++
++	body := w.Body.String()
++	for _, leak := range []string{"hunter2", "192.0.2.2", "203.0.113.9", "127.0.0.1", "Firefox", "url", "source", "remote_addr", "src="} {
++		require.False(t, strings.Contains(body, leak), "health leaks %q: %s", leak, body)
++	}
++
++	var got map[string]healthStream
++	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
++	require.Equal(t, []healthConn{{State: "external", FormatName: "rtsp", Protocol: "rtsp", BytesRecv: 1000}}, got["cam"].Producers)
++	require.Equal(t, []healthConn{
++		{FormatName: "mjpeg", Protocol: "http", BytesSend: 500, Drops: 3},
++		{FormatName: "rtsp", Protocol: "rtsp+tcp", BytesSend: 7, Packets: 2, Internal: true},
++	}, got["cam"].Consumers)
++}
++
++func TestHealthIsReadOnly(t *testing.T) {
++	for _, method := range []string{"POST", "PUT", "PATCH", "DELETE"} {
++		w := httptest.NewRecorder()
++		apiHealth(w, httptest.NewRequest(method, "/api/health?src=cam", nil))
++		require.Equal(t, http.StatusMethodNotAllowed, w.Code, method)
++		require.Equal(t, "GET", w.Header().Get("Allow"))
++	}
++}
++
++func TestHealthDoesNotWaitForADial(t *testing.T) {
++	saved := streams
++	t.Cleanup(func() { streams = saved })
++	stream := NewStream(nil)
++	streams = map[string]*Stream{"cam": stream}
++
++	dialing := &Producer{state: stateNone}
++	stream.producers = []*Producer{dialing}
++	// Dial holds the producer's lock for as long as the camera takes to answer
++	dialing.mu.Lock()
++	defer dialing.mu.Unlock()
++
++	done := make(chan *httptest.ResponseRecorder, 1)
++	go func() {
++		w := httptest.NewRecorder()
++		apiHealth(w, httptest.NewRequest("GET", "/api/health", nil))
++		done <- w
++	}()
++	select {
++	case w := <-done:
++		require.Equal(t, http.StatusOK, w.Code)
++		var got map[string]healthStream
++		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
++		require.Equal(t, []healthConn{{State: "busy"}}, got["cam"].Producers)
++	case <-time.After(2 * time.Second):
++		t.Fatal("api/health waits for a producer that is dialing")
++	}
++}
+diff --git a/internal/streams/streams.go b/internal/streams/streams.go
+index f3b8df0..2cf5b7a 100644
+--- a/internal/streams/streams.go
++++ b/internal/streams/streams.go
+@@ -28,6 +28,7 @@ func Init() {
+ 
+ 	api.HandleFunc("api/streams", apiStreams)
+ 	api.HandleFunc("api/streams.dot", apiStreamsDOT)
++	api.HandleFunc("api/health", apiHealth)
+ 	api.HandleFunc("api/preload", apiPreload)
+ 	api.HandleFunc("api/schemes", apiSchemes)
+ 

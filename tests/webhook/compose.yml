@@ -1,0 +1,105 @@
+# `just webhook-check`: a camera goes down and comes back, and an HTTP endpoint gets both changes.
+# A fake camera, a stand-in copy with its sentinel (which writes the state volume), cams-webhook
+# (which reads it) and a fake receiver. The sentinel and cams-webhook share no network, as on a
+# camera VLAN that cannot reach the endpoint: only the volume links them. Every address is in
+# TEST-NET-1 (documentation only), and both networks are internal: nothing on the LAN is reached.
+name: moonie-cams-webhook-check
+
+x-python: &python
+  # Same pinned base as sentinel/Dockerfile and webhook/Dockerfile
+  image: python:3.13.18-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+  environment:
+    PYTHONDONTWRITEBYTECODE: "1"
+  volumes:
+    - ../:/check:ro
+
+networks:
+  test:
+    internal: true
+    ipam:
+      config:
+        - subnet: 192.0.2.0/24
+          ip_range: 192.0.2.128/25
+  hook:
+    internal: true
+
+volumes:
+  state: {}
+
+secrets:
+  cams_webhook_token:
+    # A fake token, for this check only
+    file: ./token
+
+services:
+  # The real camera: anything listening on its RTSP port
+  camera:
+    <<: *python
+    command: ["python", "/check/mirror/listener.py", "camera"]
+    networks:
+      test:
+        ipv4_address: 192.0.2.10
+
+  # Stands in for the go2rtc copy: answers on 554, and is the namespace the sentinel joins
+  cam:
+    <<: *python
+    restart: unless-stopped
+    command: ["python", "/check/mirror/listener.py", "copy"]
+    networks:
+      test:
+        ipv4_address: 192.0.2.20
+
+  cam-mirror:
+    build: ../../sentinel
+    image: moonie-cams-sentinel:webhook-check
+    restart: unless-stopped
+    network_mode: service:cam
+    depends_on: [cam]
+    # Same hardening and mount as the rendered compose (app.py mirror_service); a test checks it
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      MIRROR_HOST: 192.0.2.10
+      MIRROR_PORT: "554"
+      WATCH_PORT: "554"
+      CAMERA: cam
+      STATE_DIR: /state
+    volumes:
+      - state:/state
+
+  cams-webhook:
+    build: ../../webhook
+    image: moonie-cams-webhook:check
+    restart: unless-stopped
+    # Same hardening and mount as the rendered compose (app.py webhook_service); a test checks it
+    cap_drop: [ALL]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      CAMS_WEBHOOK_URL: http://receiver:8080/webhook/check
+      CAMS_WEBHOOK_ON_START: "false"
+      WEBHOOK_HOST: moonie-cams-webhook-check
+      STATE_DIR: /state
+    volumes:
+      - state:/state:ro
+    secrets:
+      - source: cams_webhook_token
+        target: CAMS_WEBHOOK_TOKEN
+    networks: [hook]
+
+  # The endpoint: records every POST
+  receiver:
+    <<: *python
+    command: ["python", "/check/webhook/receiver.py"]
+    networks: [hook]
+
+  expect:
+    <<: *python
+    profiles: [check]
+    entrypoint: ["python", "/check/webhook/expect.py"]
+    volumes:
+      - ../:/check:ro
+      - state:/state:ro
+    networks: [hook]

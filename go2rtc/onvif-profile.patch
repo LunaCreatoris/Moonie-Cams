@@ -1,0 +1,576 @@
+ONVIF profile from the live stream for go2rtc v1.9.15 (7c05066).
+The ONVIF server advertises the stream's real size and frame rate, read from the SPS of its
+running config producer (a producer a client pushed does not count), or the ONVIF_* env values,
+instead of a fixed 1080p30 at 8192 kbit/s. DecodeSPS is hardened against crafted SPS: the frame
+rate is computed in uint64 (no division by zero), a pic order cycle over 255 is rejected, and
+SPS.Size ignores a size outside 1..8192. SystemReboot, which upstream answered with an exit of
+the whole process one second later (unauthenticated, so any LAN host could keep the copy down),
+gets an ActionNotSupported SOAP fault and changes nothing; SetSystemDateAndTime already only
+answers OK, and no other action changes state. Comes with its own tests
+(go test ./pkg/h264/ ./internal/streams/ ./internal/onvif/).
+
+diff --git a/internal/onvif/onvif.go b/internal/onvif/onvif.go
+index c305b70..7e237fd 100644
+--- a/internal/onvif/onvif.go
++++ b/internal/onvif/onvif.go
+@@ -1,20 +1,20 @@
+ package onvif
+ 
+ import (
++	"bytes"
+ 	"io"
+ 	"net"
+ 	"net/http"
+ 	"net/url"
+-	"os"
+ 	"strconv"
+ 	"strings"
+-	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/internal/api"
+ 	"github.com/AlexxIT/go2rtc/internal/app"
+ 	"github.com/AlexxIT/go2rtc/internal/rtsp"
+ 	"github.com/AlexxIT/go2rtc/internal/streams"
+ 	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/AlexxIT/go2rtc/pkg/h264"
+ 	"github.com/AlexxIT/go2rtc/pkg/onvif"
+ 	"github.com/rs/zerolog"
+ )
+@@ -26,6 +26,7 @@ func Init() {
+ 
+ 	// ONVIF server on all suburls
+ 	api.HandleFunc("/onvif/", onvifDeviceService)
++	onvif.LiveVideo = liveVideo
+ 
+ 	// ONVIF client autodiscovery
+ 	api.HandleFunc("api/onvif", apiOnvif)
+@@ -33,6 +34,30 @@ func Init() {
+ 
+ var log zerolog.Logger
+ 
++// liveVideo reads a stream's size and frame rate from the SPS of its running H.264 producer.
++func liveVideo(name string) (width, height, fps int) {
++	stream := streams.Get(name)
++	if stream == nil {
++		return
++	}
++	for _, media := range stream.LiveMedias() {
++		for _, codec := range media.Codecs {
++			if codec.Name != core.CodecH264 {
++				continue
++			}
++			if sps, _ := h264.GetParameterSet(codec.FmtpLine); len(sps) > 0 {
++				// DecodeSPS reads the raw payload: drop the emulation prevention bytes first
++				sps = bytes.ReplaceAll(sps, []byte{0, 0, 3}, []byte{0, 0})
++				if s := h264.DecodeSPS(sps); s != nil {
++					width, height = s.Size()
++					return width, height, s.FPS()
++				}
++			}
++		}
++	}
++	return
++}
++
+ func streamOnvif(rawURL string) (core.Producer, error) {
+ 	client, err := onvif.NewClient(rawURL)
+ 	if err != nil {
+@@ -105,11 +130,14 @@ func onvifDeviceService(w http.ResponseWriter, r *http.Request) {
+ 		b = onvif.GetDeviceInformationResponse("", "go2rtc", app.Version, r.Host)
+ 
+ 	case onvif.DeviceSystemReboot:
+-		b = onvif.StaticResponse(operation)
+-
+-		time.AfterFunc(time.Second, func() {
+-			os.Exit(0)
+-		})
++		// Upstream answered OK and exited a second later, unauthenticated: any host on the
++		// LAN could take the copy down in a loop. The copy is never rebooted over ONVIF.
++		w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
++		w.WriteHeader(http.StatusInternalServerError)
++		if _, err = w.Write(onvif.ActionNotSupportedFault()); err != nil {
++			log.Error().Err(err).Caller().Send()
++		}
++		return
+ 
+ 	case onvif.MediaGetVideoSources:
+ 		b = onvif.GetVideoSourcesResponse(streams.GetAllNames())
+diff --git a/internal/onvif/onvif_test.go b/internal/onvif/onvif_test.go
+new file mode 100644
+index 0000000..5b19b2e
+--- /dev/null
++++ b/internal/onvif/onvif_test.go
+@@ -0,0 +1,28 @@
++package onvif
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++const rebootRequest = `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>` +
++	`<tds:SystemReboot xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/></s:Body></s:Envelope>`
++
++func TestSystemRebootIsRefused(t *testing.T) {
++	for i := 0; i < 3; i++ {
++		w := httptest.NewRecorder()
++		onvifDeviceService(w, httptest.NewRequest("POST", "/onvif/device_service", strings.NewReader(rebootRequest)))
++		require.Equal(t, http.StatusInternalServerError, w.Code)
++		body := w.Body.String()
++		require.Contains(t, body, "<s:Fault ")
++		require.Contains(t, body, "ter:ActionNotSupported")
++		require.NotContains(t, body, "SystemRebootResponse")
++	}
++	// Upstream exits one second after a reboot request; a test binary that exits fails the run
++	time.Sleep(1500 * time.Millisecond)
++}
+diff --git a/internal/streams/live_medias_test.go b/internal/streams/live_medias_test.go
+new file mode 100644
+index 0000000..3dd2301
+--- /dev/null
++++ b/internal/streams/live_medias_test.go
+@@ -0,0 +1,47 @@
++package streams
++
++import (
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/stretchr/testify/require"
++)
++
++func TestLiveMediasCountsRunningProducersOnly(t *testing.T) {
++	running := &core.Media{Kind: core.KindVideo, ID: "running"}
++	stream := NewStream(nil)
++	stream.producers = []*Producer{
++		{conn: &healthFake{core.Connection{Medias: []*core.Media{running}}}, state: stateStart},
++		{conn: &healthFake{core.Connection{Medias: []*core.Media{{ID: "pushed"}}}}, state: stateExternal},
++		{conn: &healthFake{core.Connection{Medias: []*core.Media{{ID: "dialed"}}}}, state: stateMedias},
++		{state: stateStart},
++	}
++	require.Equal(t, []*core.Media{running}, stream.LiveMedias())
++}
++
++func TestLiveMediasDoesNotWaitForADial(t *testing.T) {
++	running := &core.Media{Kind: core.KindVideo, ID: "running"}
++	dialing := &Producer{state: stateNone}
++	stream := NewStream(nil)
++	stream.producers = []*Producer{
++		dialing,
++		{conn: &healthFake{core.Connection{Medias: []*core.Media{running}}}, state: stateStart},
++	}
++	// Dial holds the producer's lock for as long as the camera takes to answer
++	dialing.mu.Lock()
++	defer dialing.mu.Unlock()
++
++	done := make(chan []*core.Media, 1)
++	go func() { done <- stream.LiveMedias() }()
++	select {
++	case medias := <-done:
++		require.Equal(t, []*core.Media{running}, medias)
++	case <-time.After(2 * time.Second):
++		t.Fatal("LiveMedias waits for a producer that is dialing")
++	}
++
++	// The stream's own lock is free while a producer is dialing
++	require.True(t, stream.mu.TryLock())
++	stream.mu.Unlock()
++}
+diff --git a/internal/streams/stream.go b/internal/streams/stream.go
+index 984c73e..5d38ea2 100644
+--- a/internal/streams/stream.go
++++ b/internal/streams/stream.go
+@@ -47,6 +47,26 @@ func NewStream(source any) *Stream {
+ 	}
+ }
+ 
++// LiveMedias returns the medias of the config producers already running; it never starts
++// one. A producer a client pushed (stateExternal) does not count, and one that is busy
++// (Dial holds its lock while the camera answers) is skipped rather than waited for.
++func (s *Stream) LiveMedias() (medias []*core.Media) {
++	s.mu.Lock()
++	producers := append([]*Producer(nil), s.producers...)
++	s.mu.Unlock()
++
++	for _, prod := range producers {
++		if !prod.mu.TryLock() {
++			continue
++		}
++		if prod.state == stateStart && prod.conn != nil {
++			medias = append(medias, prod.conn.GetMedias()...)
++		}
++		prod.mu.Unlock()
++	}
++	return
++}
++
+ func (s *Stream) Sources() []string {
+ 	sources := make([]string, 0, len(s.producers))
+ 	for _, prod := range s.producers {
+diff --git a/pkg/h264/sps.go b/pkg/h264/sps.go
+index 1ac7394..9357555 100644
+--- a/pkg/h264/sps.go
++++ b/pkg/h264/sps.go
+@@ -87,6 +87,37 @@ func (s *SPS) Height() uint16 {
+ 	return uint16(height - crop)
+ }
+ 
++// maxSide is the largest width or height Size accepts, H.264's own limit (level 6.2).
++const maxSide = 8192
++
++// Size returns the picture size, or 0, 0 when it is outside 1..maxSide on either side. It
++// computes in int64, so crop offsets larger than the picture cannot wrap around the way
++// they do in Width and Height.
++func (s *SPS) Size() (width, height int) {
++	w := 16 * (int64(s.pic_width_in_mbs_minus_1) + 1)
++	h := 16 * (int64(s.pic_height_in_map_units_minus_1) + 1)
++	if s.frame_mbs_only_flag == 0 {
++		h *= 2
++	}
++	w -= 2 * (int64(s.frame_crop_left_offset) + int64(s.frame_crop_right_offset))
++	h -= 2 * (int64(s.frame_crop_top_offset) + int64(s.frame_crop_bottom_offset))
++	if w < 1 || w > maxSide || h < 1 || h > maxSide {
++		return 0, 0
++	}
++	return int(w), int(h)
++}
++
++// FPS returns the frame rate from the VUI timing info, or 0 when the SPS has none. It
++// computes in uint64: 2 * num_units_in_tick wraps to 0 in uint32 when the tick is 2^31.
++func (s *SPS) FPS() int {
++	if s.timing_info_present_flag == 0 || s.num_units_in_tick == 0 {
++		return 0
++	}
++	tick, scale := uint64(s.num_units_in_tick), uint64(s.time_scale)
++	// One frame is two ticks (fields), rounded to the nearest integer
++	return int((scale + tick) / (2 * tick))
++}
++
+ func DecodeSPS(sps []byte) *SPS {
+ 	// https://developer.ridgerun.com/wiki/index.php/H264_Analysis_Tools
+ 	// ffmpeg -i file.h264 -c copy -bsf:v trace_headers -f null -
+@@ -146,6 +177,10 @@ func DecodeSPS(sps []byte) *SPS {
+ 		s.offset_for_top_to_bottom_field = r.ReadSEGolomb()
+ 
+ 		s.num_ref_frames_in_pic_order_cnt_cycle = r.ReadUEGolomb()
++		// The standard caps the cycle at 255; a crafted SPS could make this loop run 2^32 times
++		if s.num_ref_frames_in_pic_order_cnt_cycle > 255 {
++			return nil
++		}
+ 		for i := uint32(0); i < s.num_ref_frames_in_pic_order_cnt_cycle; i++ {
+ 			_ = r.ReadSEGolomb() // offset_for_ref_frame[i]
+ 		}
+diff --git a/pkg/h264/sps_crafted_test.go b/pkg/h264/sps_crafted_test.go
+new file mode 100644
+index 0000000..c50d88d
+--- /dev/null
++++ b/pkg/h264/sps_crafted_test.go
+@@ -0,0 +1,147 @@
++package h264
++
++import (
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/bits"
++	"github.com/stretchr/testify/require"
++)
++
++// craftedSPS describes a Baseline SPS built bit by bit, to reach values no encoder writes.
++type craftedSPS struct {
++	pocType, pocCycle  uint32
++	widthMbs, heightMb uint32 // in macroblocks, both at least 1
++	cropLeft, cropTop  uint32
++	tick, timeScale    uint32 // VUI timing; no timing info when both are 0
++}
++
++// writeUE writes v as unsigned Exp-Golomb, the way bits.Reader.ReadUEGolomb reads it back.
++func writeUE(w *bits.Writer, v uint32) {
++	x := uint64(v) + 1
++	size := byte(0)
++	for x>>(size+1) != 0 {
++		size++
++	}
++	w.WriteAllBits(0, size)
++	w.WriteBit(1)
++	w.WriteBits(uint32(x), size)
++}
++
++func (c craftedSPS) bytes() []byte {
++	w := bits.NewWriter(nil)
++	w.WriteBits8(0x67, 8) // NAL header: SPS
++	w.WriteBits8(66, 8)   // profile_idc: Baseline
++	w.WriteBits8(0, 8)    // constraint flags
++	w.WriteBits8(30, 8)   // level_idc
++	writeUE(w, 0)         // seq_parameter_set_id
++	writeUE(w, 0)         // log2_max_frame_num_minus4
++	writeUE(w, c.pocType)
++	switch c.pocType {
++	case 0:
++		writeUE(w, 0) // log2_max_pic_order_cnt_lsb_minus4
++	case 1:
++		w.WriteBit(0) // delta_pic_order_always_zero_flag
++		writeUE(w, 0) // offset_for_non_ref_pic
++		writeUE(w, 0) // offset_for_top_to_bottom_field
++		writeUE(w, c.pocCycle)
++		if c.pocCycle <= 256 {
++			for i := uint32(0); i < c.pocCycle; i++ {
++				writeUE(w, 0) // offset_for_ref_frame[i]
++			}
++		}
++	}
++	writeUE(w, 1) // num_ref_frames
++	w.WriteBit(0) // gaps_in_frame_num_value_allowed_flag
++	writeUE(w, c.widthMbs-1)
++	writeUE(w, c.heightMb-1)
++	w.WriteBit(1) // frame_mbs_only_flag
++	w.WriteBit(1) // direct_8x8_inference_flag
++	if c.cropLeft != 0 || c.cropTop != 0 {
++		w.WriteBit(1)
++		writeUE(w, c.cropLeft)
++		writeUE(w, 0)
++		writeUE(w, c.cropTop)
++		writeUE(w, 0)
++	} else {
++		w.WriteBit(0)
++	}
++	w.WriteBit(1) // vui_parameters_present_flag
++	w.WriteBit(0) // aspect_ratio_info_present_flag
++	w.WriteBit(0) // overscan_info_present_flag
++	w.WriteBit(0) // video_signal_type_present_flag
++	w.WriteBit(0) // chroma_loc_info_present_flag
++	if c.tick != 0 || c.timeScale != 0 {
++		w.WriteBit(1)
++		w.WriteBits(c.tick, 32)
++		w.WriteBits(c.timeScale, 32)
++		w.WriteBit(1) // fixed_frame_rate_flag
++	} else {
++		w.WriteBit(0)
++	}
++	w.WriteBit(1) // rbsp_stop_one_bit
++	return append(w.Bytes(), 0, 0)
++}
++
++func TestCraftedSPS(t *testing.T) {
++	s := DecodeSPS(craftedSPS{widthMbs: 40, heightMb: 30, tick: 1, timeScale: 50}.bytes())
++	require.NotNil(t, s)
++	require.Equal(t, uint16(640), s.Width())
++	require.Equal(t, uint16(480), s.Height())
++	width, height := s.Size()
++	require.Equal(t, [2]int{640, 480}, [2]int{width, height})
++	require.Equal(t, 25, s.FPS())
++}
++
++func TestSPSFPSDoesNotWrap(t *testing.T) {
++	// 2 * num_units_in_tick is 2^32: it wraps to 0 in uint32, a division by zero
++	s := DecodeSPS(craftedSPS{widthMbs: 1, heightMb: 1, tick: 1 << 31, timeScale: 0xFFFFFFFF}.bytes())
++	require.NotNil(t, s)
++	require.Equal(t, 1, s.FPS())
++
++	s = DecodeSPS(craftedSPS{widthMbs: 1, heightMb: 1, tick: 0xFFFFFFFF, timeScale: 1}.bytes())
++	require.NotNil(t, s)
++	require.Equal(t, 0, s.FPS())
++
++	s = DecodeSPS(craftedSPS{widthMbs: 1, heightMb: 1}.bytes())
++	require.NotNil(t, s)
++	require.Equal(t, 0, s.FPS())
++}
++
++func TestSPSHugePicOrderCycle(t *testing.T) {
++	decode := func(c craftedSPS) *SPS {
++		done := make(chan *SPS, 1)
++		go func() { done <- DecodeSPS(c.bytes()) }()
++		select {
++		case s := <-done:
++			return s
++		case <-time.After(2 * time.Second):
++			t.Fatalf("DecodeSPS loops on num_ref_frames_in_pic_order_cnt_cycle=%d", c.pocCycle)
++			return nil
++		}
++	}
++
++	require.NotNil(t, decode(craftedSPS{pocType: 1, pocCycle: 255, widthMbs: 1, heightMb: 1}))
++	require.Nil(t, decode(craftedSPS{pocType: 1, pocCycle: 256, widthMbs: 1, heightMb: 1}))
++	require.Nil(t, decode(craftedSPS{pocType: 1, pocCycle: 0xFFFFFFFE, widthMbs: 1, heightMb: 1}))
++}
++
++func TestSPSSizeOutOfRange(t *testing.T) {
++	for name, c := range map[string]craftedSPS{
++		"width underflow":  {widthMbs: 1, heightMb: 1, cropLeft: 100},
++		"height underflow": {widthMbs: 1, heightMb: 1, cropTop: 8},
++		"crop wraps":       {widthMbs: 1, heightMb: 1, cropLeft: 0x80000000},
++		"too wide":         {widthMbs: 513, heightMb: 1},
++		"too high":         {widthMbs: 1, heightMb: 513},
++		"huge":             {widthMbs: 0xFFFFFFFF, heightMb: 1},
++	} {
++		s := DecodeSPS(c.bytes())
++		require.NotNil(t, s, name)
++		width, height := s.Size()
++		require.Equal(t, [2]int{0, 0}, [2]int{width, height}, name)
++	}
++
++	s := DecodeSPS(craftedSPS{widthMbs: 512, heightMb: 512}.bytes())
++	width, height := s.Size()
++	require.Equal(t, [2]int{8192, 8192}, [2]int{width, height})
++}
+diff --git a/pkg/onvif/server.go b/pkg/onvif/server.go
+index fe3ba8b..394fe02 100644
+--- a/pkg/onvif/server.go
++++ b/pkg/onvif/server.go
+@@ -2,10 +2,47 @@ package onvif
+ 
+ import (
+ 	"bytes"
++	"os"
+ 	"regexp"
++	"strconv"
+ 	"time"
+ )
+ 
++// Advertised video profile: the live stream's size and frame rate when LiveVideo finds
++// them, else the ONVIF_* environment variables (positive integers), else go2rtc's
++// defaults. The bitrate (kbit/s) has no live source.
++var (
++	envWidth   = envInt("ONVIF_WIDTH", 1920)
++	envHeight  = envInt("ONVIF_HEIGHT", 1080)
++	envFPS     = envInt("ONVIF_FPS", 30)
++	envBitrate = envInt("ONVIF_BITRATE", 8192)
++)
++
++// LiveVideo returns a stream's size and frame rate from its running producer; 0 is unknown.
++var LiveVideo func(name string) (width, height, fps int)
++
++func envInt(key string, def int) int {
++	if v, err := strconv.Atoi(os.Getenv(key)); err == nil && v > 0 {
++		return v
++	}
++	return def
++}
++
++func profile(name string) (width, height, fps, bitrate int) {
++	width, height, fps, bitrate = envWidth, envHeight, envFPS, envBitrate
++	if name == "" || LiveVideo == nil {
++		return
++	}
++	w, h, f := LiveVideo(name)
++	if w > 0 && h > 0 {
++		width, height = w, h
++	}
++	if f > 0 && f <= 240 {
++		fps = f
++	}
++	return
++}
++
+ const ServiceGetServiceCapabilities = "GetServiceCapabilities"
+ 
+ const (
+@@ -156,7 +193,7 @@ func appendProfile(e *Envelope, tag, name string) {
+ 	e.Appendf(`<trt:%s token="%s" fixed="true">`, tag, name)
+ 	e.Appendf(`<tt:Name>%s</tt:Name>`, name)
+ 	appendVideoSourceConfiguration(e, "VideoSourceConfiguration", name)
+-	appendVideoEncoderConfiguration(e, "VideoEncoderConfiguration")
++	appendVideoEncoderConfiguration(e, "VideoEncoderConfiguration", name)
+ 	e.Appendf(`</trt:%s>`, tag)
+ }
+ 
+@@ -165,10 +202,11 @@ func GetVideoSourcesResponse(names []string) []byte {
+ 	e := NewEnvelope()
+ 	e.Append(`<trt:GetVideoSourcesResponse>`)
+ 	for _, name := range names {
++		width, height, fps, _ := profile(name)
+ 		e.Appendf(`<trt:VideoSources token="%s">
+-	<tt:Framerate>30.000000</tt:Framerate>
+-	<tt:Resolution><tt:Width>1920</tt:Width><tt:Height>1080</tt:Height></tt:Resolution>
+-</trt:VideoSources>`, name)
++	<tt:Framerate>%d.000000</tt:Framerate>
++	<tt:Resolution><tt:Width>%d</tt:Width><tt:Height>%d</tt:Height></tt:Resolution>
++</trt:VideoSources>`, name, fps, width, height)
+ 	}
+ 	e.Append(`</trt:GetVideoSourcesResponse>`)
+ 	return e.Bytes()
+@@ -194,17 +232,18 @@ func GetVideoSourceConfigurationResponse(name string) []byte {
+ 
+ func appendVideoSourceConfiguration(e *Envelope, tag, name string) {
+ 	// go2rtc name = ONVIF VideoSourceConfiguration token
++	width, height, _, _ := profile(name)
+ 	e.Appendf(`<tt:%s token="%s" fixed="true">
+ 	<tt:Name>VSC</tt:Name>
+ 	<tt:SourceToken>%s</tt:SourceToken>
+-	<tt:Bounds x="0" y="0" width="1920" height="1080"></tt:Bounds>
+-</tt:%s>`, tag, name, name, tag)
++	<tt:Bounds x="0" y="0" width="%d" height="%d"></tt:Bounds>
++</tt:%s>`, tag, name, name, width, height, tag)
+ }
+ 
+ func GetVideoEncoderConfigurationsResponse() []byte {
+ 	e := NewEnvelope()
+ 	e.Append(`<trt:GetVideoEncoderConfigurationsResponse>`)
+-	appendVideoEncoderConfiguration(e, "VideoEncoderConfigurations")
++	appendVideoEncoderConfiguration(e, "VideoEncoderConfigurations", "")
+ 	e.Append(`</trt:GetVideoEncoderConfigurationsResponse>`)
+ 	return e.Bytes()
+ }
+@@ -212,23 +251,24 @@ func GetVideoEncoderConfigurationsResponse() []byte {
+ func GetVideoEncoderConfigurationResponse() []byte {
+ 	e := NewEnvelope()
+ 	e.Append(`<trt:GetVideoEncoderConfigurationResponse>`)
+-	appendVideoEncoderConfiguration(e, "VideoEncoderConfiguration")
++	appendVideoEncoderConfiguration(e, "VideoEncoderConfiguration", "")
+ 	e.Append(`</trt:GetVideoEncoderConfigurationResponse>`)
+ 	return e.Bytes()
+ }
+ 
+-func appendVideoEncoderConfiguration(e *Envelope, tag string) {
++func appendVideoEncoderConfiguration(e *Envelope, tag, name string) {
+ 	// empty `RateControl` important for UniFi Protect
++	width, height, fps, bitrate := profile(name)
+ 	e.Appendf(`<tt:%s token="vec">
+ 		<tt:Name>VEC</tt:Name>
+         <tt:UseCount>1</tt:UseCount>
+ 		<tt:Encoding>H264</tt:Encoding>
+-		<tt:Resolution><tt:Width>1920</tt:Width><tt:Height>1080</tt:Height></tt:Resolution>
++		<tt:Resolution><tt:Width>%d</tt:Width><tt:Height>%d</tt:Height></tt:Resolution>
+         <tt:Quality>0</tt:Quality>
+-		<tt:RateControl><tt:FrameRateLimit>30</tt:FrameRateLimit><tt:EncodingInterval>1</tt:EncodingInterval><tt:BitrateLimit>8192</tt:BitrateLimit></tt:RateControl>
++		<tt:RateControl><tt:FrameRateLimit>%d</tt:FrameRateLimit><tt:EncodingInterval>1</tt:EncodingInterval><tt:BitrateLimit>%d</tt:BitrateLimit></tt:RateControl>
+         <tt:H264><tt:GovLength>10</tt:GovLength><tt:H264Profile>Main</tt:H264Profile></tt:H264>
+         <tt:SessionTimeout>PT10S</tt:SessionTimeout>
+-	</tt:%s>`, tag, tag)
++	</tt:%s>`, tag, width, height, fps, bitrate, tag)
+ }
+ 
+ func GetStreamUriResponse(uri string) []byte {
+@@ -243,6 +283,17 @@ func GetSnapshotUriResponse(uri string) []byte {
+ 	return e.Bytes()
+ }
+ 
++// ActionNotSupportedFault is the ONVIF fault for an action the device does not perform
++// (SOAP 1.2 env:Receiver, subcode ter:ActionNotSupported), sent with HTTP 500.
++func ActionNotSupportedFault() []byte {
++	e := NewEnvelope()
++	e.Append(`<s:Fault xmlns:ter="http://www.onvif.org/ver10/error">` +
++		`<s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>ter:ActionNotSupported</s:Value></s:Subcode></s:Code>` +
++		`<s:Reason><s:Text xml:lang="en">The requested action is not supported.</s:Text></s:Reason>` +
++		`</s:Fault>`)
++	return e.Bytes()
++}
++
+ func StaticResponse(operation string) []byte {
+ 	switch operation {
+ 	case DeviceGetSystemDateAndTime:
+@@ -290,7 +341,7 @@ var responses = map[string]string{
+    <trt:Options>
+        <tt:QualityRange><tt:Min>1</tt:Min><tt:Max>6</tt:Max></tt:QualityRange>
+ 	   <tt:H264>
+-		   <tt:ResolutionsAvailable><tt:Width>1920</tt:Width><tt:Height>1080</tt:Height></tt:ResolutionsAvailable>
++		   <tt:ResolutionsAvailable><tt:Width>` + strconv.Itoa(envWidth) + `</tt:Width><tt:Height>` + strconv.Itoa(envHeight) + `</tt:Height></tt:ResolutionsAvailable>
+ 		   <tt:GovLengthRange><tt:Min>0</tt:Min><tt:Max>100</tt:Max></tt:GovLengthRange>
+ 		   <tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>30</tt:Max></tt:FrameRateRange>
+ 		   <tt:EncodingIntervalRange><tt:Min>1</tt:Min><tt:Max>100</tt:Max></tt:EncodingIntervalRange>

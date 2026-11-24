@@ -1,0 +1,14 @@
+# Rendered by `just copy-check` into .copy-check/out (see tests/copy_check/check.py).
+# One copy-mode camera reading the test source of compose.override.yml, with every output the
+# check plays: RTSP (passed through), HLS (passed through) and MJPEG (its own ffmpeg).
+# No ip and no host port: the checker reaches the copy by its service name, cam-copycheck.
+# No state sentinel: this check is about copy mode; `just mirror-check` covers the sentinel.
+# Its RTSP password is written to .copy-check/secrets/COPYCHECK_OUTPUT_PASSWORD by the recipe.
+cameras:
+  - name: copycheck
+    input: rtsp
+    source: rtsp://source:8554/src
+    outputs: [rtsp, hls, mjpeg]
+    mode: copy
+    mirror_state: false
+    ports: {}
