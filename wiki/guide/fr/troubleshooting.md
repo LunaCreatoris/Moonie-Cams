@@ -9,11 +9,12 @@ order: 6
 **Ce qu'on voit** : le compte de la caméra est accepté, mais elle met fin à la lecture aussitôt, et le journal de la
 copie montre une fin de flux (`EOF`) qui revient en boucle.
 
-**La cause** : une ancienne session tient encore `stream1` sur la caméra, par exemple celle d'un client qui la lisait
-en direct avant la copie. Une caméra qui n'accepte qu'une connexion par flux, comme une Tapo, refuse alors la copie.
+**La cause** : une ancienne session tient encore le flux sur la caméra, par exemple celle d'un client qui la lisait
+en direct avant la copie. Une caméra qui n'accepte qu'une connexion par flux refuse alors la copie.
 
-**La solution** : retirez de la caméra tout autre client qui la lit en direct, puis redémarrez-la. Sur une Tapo,
-vérifiez aussi que le mode privé est coupé.
+**La solution** : retirez de la caméra tout autre client qui la lit en direct, puis redémarrez-la. Vérifiez aussi
+qu'aucun mode privé de la caméra ne coupe son flux. Un cas réel est décrit dans
+[Cas testés](tested-setups.md#tapo-stale-session).
 
 ## Un mot de passe avec des caractères spéciaux {#special-characters}
 
@@ -30,8 +31,8 @@ refusés : la copie s'arrête avec une ligne qui nomme le fichier du secret, jam
 était vert.
 
 **La solution** : c'est réglé. Chaque configuration force un encodeur H.264 en profil Main, une seule tranche par
-image : certains décodeurs, dont celui d'UniFi Protect, ne lisaient que la première tranche de l'encodeur par défaut.
-Si l'image reste verte, relancez `just up` pour régénérer les copies.
+image : certains décodeurs ne lisaient que la première tranche de l'encodeur par défaut. Si l'image reste verte,
+relancez `just up` pour régénérer les copies. Voir aussi [Cas testés](tested-setups.md#unifi-protect-quirks).
 
 ## Le client garde d'anciennes valeurs {#cached-profile-values}
 

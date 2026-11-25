@@ -38,6 +38,7 @@ In every mode, a copy goes dark while its camera is offline, and comes back with
 - [Copy mode](copy-mode.md): one stream shared by several clients.
 - [The state mirror](state-mirror.md): a copy offline while its camera is.
 - [Troubleshooting](troubleshooting.md): the problems already met and how they were fixed.
+- [Tested setups](tested-setups.md): the clients and sources actually tried, step by step.
 
 ## The technical reference {#reference}
 

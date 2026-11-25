@@ -38,6 +38,7 @@ Dans tous les modes, une copie s'éteint tant que sa caméra est hors ligne, et 
 - [Le mode copie](copy-mode.md) : un flux partagé par plusieurs clients.
 - [Le miroir d'état](state-mirror.md) : une copie hors ligne quand sa caméra l'est.
 - [Dépannage](troubleshooting.md) : les problèmes déjà rencontrés et leur solution.
+- [Cas testés](tested-setups.md) : les clients et les sources essayés pour de vrai, étape par étape.
 
 ## La référence technique {#reference}
 

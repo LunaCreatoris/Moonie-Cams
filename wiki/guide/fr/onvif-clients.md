@@ -21,6 +21,8 @@ order: 2
 Cams ne fait pas de WS-Discovery : une copie n'apparaît pas toujours seule dans la recherche du client, l'ajout par
 adresse IP marche toujours.
 
+Des clients essayés pour de vrai, avec leurs étapes, sont décrits dans [Cas testés](tested-setups.md).
+
 ## Ce que le client voit {#what-the-client-sees}
 
 - **Le nom** : en mode par défaut ou copie, la copie s'annonce `cams-NOM`, fabricant `Moonie-Cams`, modèle `Cams`,

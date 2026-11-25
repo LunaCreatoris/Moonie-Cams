@@ -9,12 +9,11 @@ order: 6
 **What you see**: the camera's account is accepted, but it ends playback at once, and the copy's log shows an end
 of stream (`EOF`) over and over.
 
-**The cause**: an old session still holds `stream1` on the camera, for example that of a client that read it
-directly before the copy. A camera that accepts only one connection per stream, such as a Tapo, then refuses the
-copy.
+**The cause**: an old session still holds the stream on the camera, for example that of a client that read it
+directly before the copy. A camera that accepts only one connection per stream then refuses the copy.
 
-**The fix**: remove every other client that reads the camera directly, then reboot it. On a Tapo, also check that
-privacy mode is off.
+**The fix**: remove every other client that reads the camera directly, then reboot it. Also check that no privacy
+mode of the camera cuts its stream. A real case is described in [Tested setups](tested-setups.md#tapo-stale-session).
 
 ## A password with special characters {#special-characters}
 
@@ -31,8 +30,8 @@ with one line naming the secret's file, never its value. Change that password th
 was green.
 
 **The fix**: this is solved. Every config forces a Main-profile H.264 encoder with a single slice per frame: some
-decoders, UniFi Protect's among them, read only the first slice of the default encoder. If the picture stays green,
-run `just up` again to render the copies afresh.
+decoders read only the first slice of the default encoder. If the picture stays green, run `just up` again to render
+the copies afresh. See also [Tested setups](tested-setups.md#unifi-protect-quirks).
 
 ## The client keeps old values {#cached-profile-values}
 

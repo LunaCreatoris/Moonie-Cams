@@ -6,10 +6,10 @@ order: 3
 
 ## Pourquoi un proxy {#why-a-proxy}
 
-Certaines caméras n'acceptent qu'une connexion par flux ; c'est le cas des Tapo, pour lesquelles ce mode a été écrit.
-Quand plusieurs clients veulent la même caméra, en `mode: proxy` la copie se présente comme la caméra :
+Certaines caméras n'acceptent qu'une connexion par flux. Quand plusieurs clients veulent la même caméra, en
+`mode: proxy` la copie se présente comme la caméra :
 
-- go2rtc tient la seule session RTSP de chaque flux (`stream1` et `stream2`), sans réencodage ;
+- go2rtc tient la seule session RTSP de chaque flux (`source` et `source_sub`), sans réencodage ;
 - un petit proxy ONVIF relaie vers la vraie caméra les lectures, les commandes de pan-tilt et les événements, et
   réécrit les adresses pour qu'elles pointent sur la copie.
 
@@ -26,14 +26,17 @@ cameras:
     outputs: [onvif]
     ip: 198.51.100.22
     mode: proxy
-    onvif_url: http://192.0.2.11:2020
+    onvif_url: http://192.0.2.11
     ptz_hold: 5
     proxy_log: writes
 ```
 
-- `onvif_url` est l'adresse ONVIF de la vraie caméra, sans compte ni chemin (port 2020 sur une Tapo).
+- `onvif_url` est l'adresse ONVIF de la vraie caméra, sans compte ni chemin. Sans port, c'est le port 80 ; ajoutez
+  celui de la caméra s'il est autre.
 - Un seul compte : les clients donnent à la copie le compte de la vraie caméra, pour ONVIF comme pour RTSP.
 - Le proxy répond sur les ports 80 et 2020. Dans ce mode, l'API de go2rtc (MJPEG, HLS, WebRTC) passe sur le port 1984.
+
+Une caméra configurée pas à pas en mode proxy est décrite dans [Cas testés](tested-setups.md#tapo).
 
 ## Plusieurs clients ensemble {#several-clients}
 

@@ -34,7 +34,7 @@ cameras:
 
   - name: garage
     input: mjpeg
-    source: http://192.0.2.30:8080/?action=stream
+    source: http://192.0.2.30:8080/video.mjpg
     outputs: [onvif]
     ip: 198.51.100.21
 ```
@@ -43,6 +43,8 @@ cameras:
 - `input` est le format de la source, `outputs` les formats servis. Une sortie ne peut pas être le format d'entrée,
   sauf en [mode copie](copy-mode.md).
 - `ip` est l'adresse de la copie, nécessaire pour ONVIF.
+- Une source `mjpeg` est l'adresse HTTP du flux MJPEG lui-même, pas celle d'une page qui l'affiche. Une webcam
+  d'imprimante 3D est décrite dans [Cas testés](tested-setups.md#octoprint).
 
 Toutes les clés sont décrites dans la section
 [Add a camera](https://github.com/LunaCreatoris/Moonie-Cams/blob/main/README.md#add-a-camera) du README.
