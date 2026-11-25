@@ -4,16 +4,16 @@ description: Les problèmes déjà rencontrés avec de vraies caméras, et ce qu
 order: 6
 ---
 
-## Une Tapo coupe le flux dès sa lecture {#tapo-stale-session}
+## La caméra coupe le flux dès sa lecture {#stale-source-session}
 
-**Ce qu'on voit** : le compte caméra est accepté, mais la Tapo met fin à la lecture aussitôt, et le journal de la copie
-montre une fin de flux (`EOF`) qui revient en boucle.
+**Ce qu'on voit** : le compte de la caméra est accepté, mais elle met fin à la lecture aussitôt, et le journal de la
+copie montre une fin de flux (`EOF`) qui revient en boucle.
 
-**La cause** : une ancienne session tient encore `stream1` sur la Tapo, par exemple celle d'un client qui la lisait en
-direct avant la copie. La Tapo n'accepte qu'une connexion par flux.
+**La cause** : une ancienne session tient encore `stream1` sur la caméra, par exemple celle d'un client qui la lisait
+en direct avant la copie. Une caméra qui n'accepte qu'une connexion par flux, comme une Tapo, refuse alors la copie.
 
-**La solution** : retirez de la Tapo tout autre client (Protect en direct, l'entité caméra de l'intégration Tapo),
-puis redémarrez la caméra. Vérifiez aussi que son mode privé est coupé.
+**La solution** : retirez de la caméra tout autre client qui la lit en direct, puis redémarrez-la. Sur une Tapo,
+vérifiez aussi que le mode privé est coupé.
 
 ## Un mot de passe avec des caractères spéciaux {#special-characters}
 
@@ -26,22 +26,22 @@ refusés : la copie s'arrête avec une ligne qui nomme le fichier du secret, jam
 
 ## Une image verte sous la première bande {#green-picture}
 
-**Ce qu'on voyait** : Protect n'affichait correctement que le haut d'un flux MJPEG réencodé, le reste de l'image
+**Ce qu'on voyait** : un client n'affichait correctement que le haut d'un flux MJPEG réencodé, le reste de l'image
 était vert.
 
 **La solution** : c'est réglé. Chaque configuration force un encodeur H.264 en profil Main, une seule tranche par
-image : Protect ne décodait que la première tranche de l'encodeur par défaut. Si l'image reste verte, relancez
-`just up` pour régénérer les copies.
+image : certains décodeurs, dont celui d'UniFi Protect, ne lisaient que la première tranche de l'encodeur par défaut.
+Si l'image reste verte, relancez `just up` pour régénérer les copies.
 
-## Protect garde d'anciennes valeurs {#protect-cached-values}
+## Le client garde d'anciennes valeurs {#cached-profile-values}
 
-**Ce qu'on voit** : après un changement de taille, de cadence, de débit ou de flux, Protect affiche encore les
+**Ce qu'on voit** : après un changement de taille, de cadence, de débit ou de flux, le client affiche encore les
 anciennes valeurs.
 
-**La cause** : Protect garde les valeurs d'un profil vues à l'adoption.
+**La cause** : certains clients ONVIF gardent les valeurs d'un profil vues à l'ajout de la caméra.
 
-**La solution** : retirez la caméra de Protect et adoptez-la de nouveau. Voir
-[Adopter dans UniFi Protect](unifi-protect.md).
+**La solution** : retirez la caméra du client et ajoutez-la de nouveau. Voir
+[Ajouter à un client](onvif-clients.md).
 
 ## Plus d'aide {#more-help}
 

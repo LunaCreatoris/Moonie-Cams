@@ -1,8 +1,11 @@
 # Moonie-Cams
 
-A camera stream comes in in one format and goes out in others. The main use: make any camera
-(a Tapo, an ESP32-CAM, an OctoPrint webcam) look like an ONVIF camera that UniFi Protect can adopt,
-and give Home Assistant its RTSP stream at the same time.
+Cams translates and copies your cameras' streams. A stream comes in in one format and goes out in
+the ones you need: ONVIF, RTSP, MJPEG, HLS, WebRTC or RTMP. A single connection to the real camera,
+shared by every client.
+
+A camera that can only serve RTSP or MJPEG becomes an ONVIF camera that any ONVIF client can add, while its stream stays readable over
+RTSP, MJPEG, HLS or WebRTC at the same time.
 
 All the streaming is done by [go2rtc](https://github.com/AlexxIT/go2rtc) (MIT) 1.9.15 with its
 ffmpeg. Each camera gets its own go2rtc container. `app.py` only turns
@@ -14,7 +17,7 @@ camera and its clients except go2rtc.
 - Reconnects on its own when the source drops.
 - No recording, no storage.
 
-A step-by-step guide, from the first camera to UniFi Protect adoption, is in
+A step-by-step guide, from the first camera to adding it to an ONVIF client, is in
 [`wiki/guide/en/index.md`](wiki/guide/en/index.md) (also [in French](wiki/guide/fr/index.md)).
 
 ## Requirements
@@ -33,9 +36,9 @@ A step-by-step guide, from the first camera to UniFi Protect adoption, is in
    raw password only (a trailing newline is fine; `@`, `^`, `:` or `/` are fine too, see "How it is
    built"; only `"`, `\`, control characters and Unicode spaces are refused):
    - `secrets/<NAME>_SOURCE_PASSWORD` (or whatever `${KEY}` the source URL uses): the password
-     go2rtc gives the real camera, e.g. the Tapo camera account;
+     go2rtc gives the real camera (the camera's own account);
    - `secrets/<NAME>_OUTPUT_PASSWORD`: the password of the copy's own RTSP account (user `cams`
-     unless `output_user` says otherwise), which Protect and Home Assistant give the copy.
+     unless `output_user` says otherwise), which the clients give the copy.
 4. Optional: to be told when a camera goes down or comes back, see "Webhook support".
 5. `just up`. The first run builds the patched go2rtc image from source, which takes a few minutes
    (see "How it is built"). Then `just logs`, `just logs cam-c100`, `just down`.
@@ -105,8 +108,8 @@ so it refuses `fps`, `bitrate` and `size`.
 
 An output may never be the input's own format: `app.py render` refuses it and names the camera
 (unless the camera sets `mode: copy`, below).
-The ONVIF output serves its RTSP stream too, so a Tapo with `outputs: [onvif]` already gives Home
-Assistant its RTSP. go2rtc runs ffmpeg only when an output needs a video codec the input lacks, and
+The ONVIF output serves its RTSP stream too, so a camera with `outputs: [onvif]` already serves
+RTSP too. go2rtc runs ffmpeg only when an output needs a video codec the input lacks, and
 only while such a client is connected:
 
 | Input \ output                  | onvif, rtsp, rtmp, hls, webrtc (H.264) | mjpeg      |
@@ -129,7 +132,7 @@ that allows one client, so that several clients share that one connection:
 
 ```yaml
 cameras:
-  # Tapo C200: its one RTSP stream shared by Home Assistant and UniFi Protect, plus MJPEG.
+  # A camera that allows one RTSP client: its stream shared by several clients, plus MJPEG.
   - name: c200
     mode: copy
     input: rtsp
@@ -138,7 +141,7 @@ cameras:
     ip: 198.51.100.54
 ```
 
-Home Assistant and Protect both read `rtsp://cams:<password>@198.51.100.54:554/c200` (one RTSP
+Every RTSP client reads `rtsp://cams:<password>@198.51.100.54:554/c200` (one RTSP
 output, any number of clients), and a browser reads
 `http://198.51.100.54/api/stream.mjpeg?src=c200_mjpeg`.
 
@@ -196,7 +199,7 @@ connection.
 Every copy, in every mode, has a state sentinel next to it (`cam-<name>-mirror`, built from
 `sentinel/`). While the real camera is down, the copy looks unplugged: no ping, no ONVIF, no RTSP,
 nothing. It comes back on its own with the camera. Without it, a copy whose camera is off keeps
-answering ONVIF, and UniFi Protect shows it online with no picture.
+answering ONVIF, and an ONVIF client shows it online with no picture.
 
 - **Probe.** Every 5 s the sentinel opens a TCP connection to the source's host and port (from
   `source`; rtsp 554, rtsps 322, onvif and http 80, https 443, rtmp 1935 when the URL gives none)
@@ -245,8 +248,7 @@ closes it again, and after the copy stays stopped past the sentinel's restart, `
 ## Webhook support
 
 When a source camera goes down or comes back, Cams POSTs one JSON message to an HTTP endpoint of
-your choice: anything that accepts a JSON POST, such as an n8n Webhook node, a Home Assistant
-webhook trigger or a small receiver of your own. It is built on the state mirror: a camera with
+your choice: anything that accepts a JSON POST. It is built on the state mirror: a camera with
 `mirror_state: false` sends nothing.
 
 The body, `Content-Type: application/json`:
@@ -267,24 +269,19 @@ With a token, the request also carries `Authorization: Bearer <token>`.
 
 ### Set it up
 
-1. Create the endpoint, for example an n8n workflow starting with a **Webhook** node (method
-   `POST`). Copy its production URL.
+1. Create the endpoint: any HTTP receiver that accepts a `POST` with a JSON body. Note its URL.
 2. In `.env`:
    - `CAMS_WEBHOOK_URL`: that URL, `http://` or `https://`;
    - `CAMS_WEBHOOK_NETWORK`: the existing Docker network the endpoint is reachable on (for
-     example the network n8n is on). Required whenever `CAMS_WEBHOOK_URL` is set: `just render` fails early
+     example the network the receiver's container is on). Required whenever `CAMS_WEBHOOK_URL` is set: `just render` fails early
      without it;
    - `CAMS_WEBHOOK_ON_START`: `true` to also post the state of each camera `cams-webhook` sees
      for the first time, at its start or later (default `false`: only changes are posted).
 3. Optional token: put it in `secrets/CAMS_WEBHOOK_TOKEN` (one line, printable ASCII, no space),
-   readable by uid 65534 (`chmod 644` on Linux), and check it on the endpoint's side (n8n: Webhook
-   node, Authentication `Header Auth`, name `Authorization`, value `Bearer <token>`). The file is
+   readable by uid 65534 (`chmod 644` on Linux), and check it on the endpoint's side (header
+   `Authorization`, value `Bearer <token>`). The file is
    mounted only when it exists at `just render`.
 4. `just up`. `just logs cams-webhook` shows one line per message sent.
-
-n8n tip: Webhook node → an HTTP Request node posting to a notification service of your choice
-(Signal, ntfy, Telegram…), with a text such as
-`{{ $json.body.camera }} is {{ $json.body.state }} since {{ $json.body.since }}`.
 
 ### How it works
 
@@ -312,7 +309,7 @@ n8n tip: Webhook node → an HTTP Request node posting to a notification service
   answer other than `408` and `429` is final: logged and dropped at once, never retried. Each
   camera has its own mailbox and worker: a slow or failing endpoint never delays another camera.
   Redirects are not followed (they would carry the token elsewhere). The token and the URL's path
-  (an n8n webhook's secret) are never logged.
+  (which often carries the endpoint's secret) are never logged.
 - **The state volume is shared.** Every sentinel mounts it read-write, so any sentinel can write
   any camera's file. `cams-webhook` treats each file as hostile: it never follows a symlink, never
   blocks on a FIFO, skips anything that is not a regular file of at most 4 KiB, and skips a file
@@ -345,8 +342,8 @@ list (which would show source URLs) are switched off.
 
 ## Proxy mode: a full copy of a Tapo (PTZ, events)
 
-A Tapo (C100, C210 with pan-tilt) accepts one connection per stream, and both UniFi Protect and
-Home Assistant want it. With `mode: proxy`, the copy presents itself as the camera: a small ONVIF
+A Tapo (C100, C210 with pan-tilt) accepts one connection per stream, and several clients may want
+it. With `mode: proxy`, the copy presents itself as the camera: a small ONVIF
 proxy (`proxy/onvif_proxy.py`, Flask + waitress + requests + lxml, pinned) relays ONVIF calls
 (device, media, PTZ, events, imaging; only reads, PTZ commands and event calls, since any other
 write would change the camera for every client, see "What is refused") to the real Tapo, and
@@ -393,7 +390,7 @@ sets nothing and the proxy's default, `writes`, applies.
   GetHostname `cams-<name>`, GetNetworkProtocols the ports the copy serves (HTTP 80 and 2020, RTSP
   554, no HTTPS). GetNetworkInterfaces drops IPv6: the copy has none, and the Tapo's link-local
   address is made from its MAC. A stream URI that carries an account (`rtsp://user:pw@<tapo>/...`)
-  points to go2rtc without it. GetDeviceInformation is untouched, so Protect shows the Tapo's model
+  points to go2rtc without it. GetDeviceInformation is untouched, so a client shows the Tapo's model
   and firmware. An answer that is not SOAP (an HTML error page) gets the same address rewrite as
   text. An answer with nothing to rewrite is relayed byte for byte.
 - **What is not rewritten.** Anything that does not name the Tapo's own address is relayed as the
@@ -401,8 +398,8 @@ sets nothing and the proxy's default, `writes`, applies.
   - the gateway, DNS and NTP addresses (GetNetworkDefaultGateway, GetDNS, GetNTP, and those in
     GetNetworkInterfaces): they are the LAN's, and the copy shares the LAN;
   - the serial number and hardware ID in GetDeviceInformation, which a Tapo may derive from its
-    MAC, and the scopes (GetScopes: name, location, hardware, sometimes a MAC): Protect and Home
-    Assistant may show them, and they identify the real camera, not its copy;
+    MAC, and the scopes (GetScopes: name, location, hardware, sometimes a MAC): a client may
+    show them, and they identify the real camera, not its copy;
   - any address given by host name other than the one in `onvif_url`, and an `http://<tapo>:<port>`
     URL on another port than the ONVIF one keeps that port.
 - **What is refused (fail closed).** A request that is refused gets a SOAP fault (`env:Sender`) and
@@ -430,18 +427,18 @@ sets nothing and the proxy's default, `writes`, applies.
     Media2 (encoder and source configurations, profiles, OSD, multicast), Imaging (image settings,
     focus), DeviceIO, Recording, Analytics, and any call or service the proxy does not know. There
     is one real camera behind every copy and client, so one client's SetVideoEncoderConfiguration
-    would change the main stream for all of them. Protect and Home Assistant only read these
-    services to adopt and stream (profiles, stream and snapshot URIs, options); Home Assistant's
+    would change the main stream for all of them. The ONVIF clients tested only read these
+    services to add and stream a camera (profiles, stream and snapshot URIs, options); a client's
     reboot, set-time, IR lamp and autofocus controls belong on the real camera, not on its copy.
     The Device writes are also refused when they are nested anywhere in the Body;
   - WS-BaseNotification `Subscribe` (push mode), by its Body, its action headers or nested
     anywhere in the Body: it would make the real Tapo POST its notifications, with its own
-    identity, to any address the client gives, and so open connections to any host. Home
-    Assistant falls back to PullPoint subscriptions, which are relayed;
+    identity, to any address the client gives, and so open connections to any host. A client
+    falls back to PullPoint subscriptions, which are relayed;
   - namespaces are compared without case and trailing slashes
     (`HTTP://www.onvif.org/ver10/device/wsdl/` is the Device service);
   - a body over 1 MiB (HTTP 413), and a malformed Host header.
-- **Ports.** The proxy answers ONVIF on port 80 (where Protect looks) and 2020 (like a Tapo). go2rtc's
+- **Ports.** The proxy answers ONVIF on port 80 (where clients look by default) and 2020 (like a Tapo). go2rtc's
   API moves to port 1984 in this mode: MJPEG, HLS and WebRTC of a proxied copy are there.
 - **Tapo down.** The client gets a clean SOAP fault, `camera unreachable`.
 - **No session.** Each call is one plain request to the Tapo: no cookie, proxy setting or `.netrc`
@@ -452,13 +449,13 @@ sets nothing and the proxy's default, `writes`, applies.
 
 ### PTZ arbitration
 
-Protect and Home Assistant both drive PTZ through the proxy. Priority goes to the first who sent a
+Every client drives PTZ through the proxy. Priority goes to the first who sent a
 command: the first client (by source IP) that sends a PTZ command (a PTZ call of ptz.wsdl that is
 not a `Get…`: moves, Stop, presets; any other is refused) holds PTZ until `ptz_hold` seconds
 (default 5) after its last PTZ command. The other client's commands get a SOAP fault
 (`env:Receiver`, "PTZ is in use by another client") rather than a silent success: a fake success
 would let its UI believe the camera moved,
-while a fault shows that the command was dropped, and both ONVIF clients handle it as a failed
+while a fault shows that the command was dropped, and the ONVIF clients tested handle it as a failed
 call. Stop counts as a command, so the loser cannot stop the holder's move. Reads (GetStatus,
 GetPresets, …) are never blocked. Only a command the camera answers with a 2xx that is not a SOAP
 Fault takes the hold, so a refused one (bad credentials) takes none. A PTZ command name nested
@@ -537,51 +534,48 @@ start on any other value:
 - `writes` (the default): every call that is not a `Get…`, except the event calls a client repeats
   forever (`PullMessages`, `Renew`); every refusal and PTZ decision; every call of the PTZ service,
   its reads included; and every error (camera unreachable, or a camera status of 400 or more but
-  401, the challenge an HTTP digest exchange starts with). Home Assistant's PullMessages long polls
+  401, the challenge an HTTP digest exchange starts with). The PullMessages long polls
   and the clients' `GetSystemDateAndTime` and other reads stay out;
 - `off`: nothing.
 
-### Adopt a proxied copy in UniFi Protect
+### Add a proxied copy to a client
 
-1. **Un-adopt the Tapo from Protect first** if it was adopted directly: the copy holds the only RTSP
-   session of each stream, so Protect cannot read both.
-2. Settings > System, turn on "Discover Third-Party Cameras", then "Advanced Adoption" with the
-   copy's IP and the Tapo camera account. There is no WS-Discovery for now: the copy does not show up
-   on its own, adoption is by IP only.
-3. Protect sees the copy as its own camera (its own IP and MAC), with the Tapo's model.
+1. **Remove the real camera first** from every client that reads it directly: the copy holds the
+   only RTSP session of each stream, so a client cannot read both.
+2. Add the copy as an ONVIF camera by its IP (port 80 or 2020) with the real camera's account. There
+   is no WS-Discovery for now: the copy does not show up on its own, it is added by IP only.
+3. The client sees the copy as its own camera (its own IP and MAC), with the real camera's model,
+   and gets the streams, PTZ and the events through it.
 
-### Add a proxied copy to Home Assistant
+A tool that keeps talking to the real camera for its own controls (privacy mode, alarm, LED…) may
+stay, as long as it never opens RTSP on it: it would take the camera's only session.
 
-Add the ONVIF integration pointed at the copy (its IP, port 80 or 2020, the Tapo camera account):
-it gets the streams, PTZ and the events through the copy. The Tapo HACS integration may keep
-talking to the real camera for its extra controls (privacy mode, alarm, LED…), but its camera
-entity must not open RTSP: turn off its stream (or its camera entities), or it takes the Tapo's
-only session.
+## Add a copy to an ONVIF client
 
-## Adopt a copy in UniFi Protect
-
-1. In Protect, Settings > System, turn on "Discover Third-Party Cameras".
-2. The copy is on the same LAN as the console, so it may show up in the device list; otherwise use
-   "Advanced Adoption" with the copy's IP (ONVIF on port 80).
-3. Give the copy's RTSP account: user `cams` (or `output_user`), password from
+1. Add the copy as an ONVIF camera by its IP (ONVIF on port 80). Without WS-Discovery, it may not
+   show up in the client's search on its own.
+2. Give the copy's RTSP account: user `cams` (or `output_user`), password from
    `secrets/<NAME>_OUTPUT_PASSWORD`.
-4. Protect names the copy after its container, `cams-<name>` (manufacturer `Moonie-Cams`, model
+3. The copy announces itself after its container, `cams-<name>` (manufacturer `Moonie-Cams`, model
    `Cams`), the name `docker ps` and `just logs` show.
-5. Each go2rtc stream is one ONVIF profile, so `source_sub` gives Protect its low-quality stream.
-   If the streams change after adoption, remove the camera from Protect and adopt it again.
+4. Each go2rtc stream is one ONVIF profile, so `source_sub` gives the client a low-quality stream.
+   Some clients keep the profile values they saw when the camera was added: if the streams change,
+   remove the camera from the client and add it again.
 
-## Read a copy from Home Assistant
+UniFi Protect adds a third-party ONVIF camera only once "Discover Third-Party Cameras" is on
+(Settings > System), through "Advanced Adoption" when the copy is not listed.
 
-Add a Generic Camera (or any RTSP integration) with
-`rtsp://cams:<password>@<ip>:554/<name>` (`<name>_sub` for the small stream). Pan-tilt and motion
-stay with the Tapo integration, which talks to the real camera.
+## Read a copy over RTSP
+
+Any RTSP client reads `rtsp://cams:<password>@<ip>:554/<name>` (`<name>_sub` for the small
+stream). A plain copy carries no pan-tilt and no events: use `mode: proxy` for those.
 
 ## How it is built
 
 ### go2rtc is built from source, with four patches
 
 Upstream go2rtc's ONVIF server advertises every stream as 1920x1080 at 30 fps and 8192 kbit/s,
-whatever the stream really is. UniFi Protect shows those values and sizes its storage from them.
+whatever the stream really is. A client shows those values, and may size its storage from them.
 `go2rtc/onvif-profile.patch` makes it advertise, for each value:
 
 1. the stream's own size and frame rate, read from the H.264 SPS of the stream's producer when one
@@ -608,13 +602,13 @@ asks for the copy's RTSP account.
 
 `go2rtc/onvif-vendor-identity.patch` gives each copy its own identity. Upstream announces every
 server as go2rtc (GetDeviceInformation's Model, and the `name/go2rtc` and `location/github` scopes),
-so UniFi Protect named every copy "go2rtc". The patch reads `ONVIF_NAME`, `ONVIF_MANUFACTURER`,
+so a client named every copy "go2rtc". The patch reads `ONVIF_NAME`, `ONVIF_MANUFACTURER`,
 `ONVIF_MODEL` and `ONVIF_LOCATION` instead (scope values URL-escaped, every field XML-escaped);
 `ONVIF_LOCATION` set to an empty value drops the location scope. Unset, upstream's values stay.
 `app.py` sets the name to the copy's container name (`cams-<name>`, the same value as in the
 rendered `compose.yml`), the manufacturer to `Moonie-Cams`, the model to `Cams`, and the location
 to the camera's `location` (none by default). The serial number stays upstream's: the address the
-client reached, unique per copy since each copy has its own IP, which Home Assistant needs. A
+client reached, unique per copy since each copy has its own IP, which clients use to tell cameras apart. A
 proxied copy (`mode: proxy`) gets none of this: it relays the real camera's own identity.
 
 The image starts go2rtc through `go2rtc/check-secrets.sh` (between upstream's `tini` and its
@@ -676,13 +670,13 @@ is unchanged.
   that crashes once. If go2rtc is recreated rather than restarted, run `just up` again.
 - State mirror: ARP is not filtered (nft `inet` sees IP only), so a closed copy still answers
   ARP for its address; nothing above ARP answers.
-- One go2rtc container and one LAN IP per camera Protect adopts (Protect identifies a camera by its
-  address).
+- One go2rtc container and one LAN IP per camera a client adds (a client may identify a camera by
+  its address; UniFi Protect does).
 - go2rtc's ONVIF server does not check credentials; the RTSP stream it points to does. It
   answers `SystemReboot` with an `ActionNotSupported` fault and never restarts
   (`go2rtc/onvif-profile.patch`; upstream exits the whole copy a second later).
-- With macvlan, the Docker host itself cannot reach the copies (other machines can). Run Home
-  Assistant on another host, or add a macvlan shim interface on the host.
+- With macvlan, the Docker host itself cannot reach the copies (other machines can). Run the
+  clients on another host, or add a macvlan shim interface on the host.
 - Keep the host clock right (NTP): ONVIF clients may check the camera time.
 
 ## Licence

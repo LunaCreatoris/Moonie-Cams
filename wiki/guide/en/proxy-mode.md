@@ -1,16 +1,16 @@
 ---
-title: Share a Tapo
-description: Proxy mode shares a Tapo between UniFi Protect and Home Assistant, pan-tilt and events included.
+title: Proxy mode
+description: Proxy mode shares an ONVIF camera between several clients, pan-tilt and events included.
 order: 3
 ---
 
 ## Why a proxy {#why-a-proxy}
 
-A Tapo accepts only one connection per stream, and both Protect and Home Assistant want it. With `mode: proxy`, the
-copy presents itself as the camera:
+Some cameras accept only one connection per stream; Tapo cameras do, and this mode was written for them. When
+several clients want the same camera, with `mode: proxy` the copy presents itself as the camera:
 
 - go2rtc holds the single RTSP session of each stream (`stream1` and `stream2`), never re-encoded;
-- a small ONVIF proxy relays reads, pan-tilt commands and events to the real Tapo, and rewrites the addresses so that
+- a small ONVIF proxy relays reads, pan-tilt commands and events to the real camera, and rewrites the addresses so that
   they point to the copy.
 
 Any other setting (reboot, network, encoder, image) is refused: it would change the camera for every client.
@@ -31,18 +31,17 @@ cameras:
     proxy_log: writes
 ```
 
-- `onvif_url` is the Tapo's ONVIF address, port 2020, with no account and no path.
-- One account: clients give the copy the Tapo camera account, for ONVIF and RTSP alike.
+- `onvif_url` is the real camera's ONVIF address, with no account and no path (port 2020 on a Tapo).
+- One account: clients give the copy the real camera's account, for ONVIF and RTSP alike.
 - The proxy answers on ports 80 and 2020. In this mode, go2rtc's API (MJPEG, HLS, WebRTC) moves to port 1984.
 
-## Protect and Home Assistant together {#protect-and-home-assistant}
+## Several clients together {#several-clients}
 
-1. Remove the Tapo from Protect if it was adopted directly, then adopt the copy by its address with the camera
-   account. See [Adopt in UniFi Protect](unifi-protect.md).
-2. In Home Assistant, add the ONVIF integration pointed at the copy (port 80 or 2020, camera account): it gets the
-   streams, pan-tilt and the events.
-3. The HACS Tapo integration may keep the real camera for its extra settings (privacy mode, alarm, LED), but turn off
-   its stream or its camera entities: otherwise it takes the Tapo's only session.
+1. Remove the real camera from every client that read it directly.
+2. Add the copy to each ONVIF client, by its address (port 80 or 2020) and with the camera's account: each one gets
+   the streams, pan-tilt and the events. See [Add to a client](onvif-clients.md).
+3. A tool that still talks to the real camera for its own settings (privacy mode, alarm, LED) may stay, as long as it
+   does not open its stream: otherwise it takes the camera's only session.
 
 ## Pan-tilt arbitration {#ptz-arbitration}
 

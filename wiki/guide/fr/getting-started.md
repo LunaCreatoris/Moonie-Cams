@@ -6,7 +6,7 @@ order: 1
 
 ## Ce qu'il faut {#requirements}
 
-- Un hôte Linux avec Docker et Docker Compose, branché sur le réseau local des clients (Protect, Home Assistant).
+- Un hôte Linux avec Docker et Docker Compose, branché sur le réseau local des clients qui liront les copies.
 - [just](https://github.com/casey/just) : chaque étape est une recette, et chaque recette tourne dans Docker.
 - Une adresse libre sur le réseau local pour chaque copie, hors de la plage DHCP. Chaque copie a sa propre adresse
   et sa propre adresse MAC (un réseau `macvlan`), comme une vraie caméra.
@@ -16,8 +16,8 @@ order: 1
 Copiez `.env.example` en `.env` et donnez l'interface de l'hôte, le sous-réseau et la passerelle sur lesquels les
 copies prennent leur adresse.
 
-Avec `macvlan`, l'hôte Docker lui-même ne joint pas les copies ; les autres machines, si. Faites tourner Home
-Assistant sur un autre hôte, ou ajoutez une interface `macvlan` de liaison sur l'hôte.
+Avec `macvlan`, l'hôte Docker lui-même ne joint pas les copies ; les autres machines, si. Faites tourner les
+clients sur un autre hôte, ou ajoutez une interface `macvlan` de liaison sur l'hôte.
 
 ## Décrire les caméras {#cameras}
 
@@ -52,10 +52,9 @@ Toutes les clés sont décrites dans la section
 Un mot de passe ne s'écrit jamais dans `cameras.yaml` : on y met `${CLE}`, et le mot de passe brut va dans le fichier
 `secrets/CLE`, seul, sans guillemets.
 
-- `secrets/ENTREE_SOURCE_PASSWORD` : le mot de passe que la copie donne à la vraie caméra, par exemple le compte
-  caméra de la Tapo.
-- `secrets/ENTREE_OUTPUT_PASSWORD` : le mot de passe du compte RTSP de la copie (utilisateur `cams`), que Protect et
-  Home Assistant donnent à la copie.
+- `secrets/ENTREE_SOURCE_PASSWORD` : le mot de passe que la copie donne à la vraie caméra, celui de son compte.
+- `secrets/ENTREE_OUTPUT_PASSWORD` : le mot de passe du compte RTSP de la copie (utilisateur `cams`), que les clients donnent
+  à la copie.
 
 Les caractères `@`, `^`, `:` et `/` sont acceptés. Seuls `"`, `\`, les caractères de contrôle et les espaces
 Unicode (comme l'espace insécable) sont refusés : la copie s'arrête alors avec une ligne qui nomme le fichier, jamais
@@ -75,4 +74,4 @@ construit l'image go2rtc la première fois, puis lance ou met à jour chaque cop
 - `just down` arrête toutes les copies.
 - `just check` vérifie le code et un rendu de l'exemple.
 
-Ensuite : [adopter les copies dans UniFi Protect](unifi-protect.md).
+Ensuite : [ajouter les copies à un client](onvif-clients.md).

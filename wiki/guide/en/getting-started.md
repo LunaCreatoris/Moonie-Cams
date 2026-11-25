@@ -6,7 +6,7 @@ order: 1
 
 ## What you need {#requirements}
 
-- A Linux host with Docker and Docker Compose, on the local network of the clients (Protect, Home Assistant).
+- A Linux host with Docker and Docker Compose, on the local network of the clients that will read the copies.
 - [just](https://github.com/casey/just): every step is a recipe, and every recipe runs in Docker.
 - A free address on the local network for each copy, outside the DHCP range. Each copy has its own address and its
   own MAC address (a `macvlan` network), like a real camera.
@@ -16,8 +16,8 @@ order: 1
 Copy `.env.example` to `.env` and give the host interface, the subnet and the gateway the copies take their address
 on.
 
-With `macvlan`, the Docker host itself cannot reach the copies; other machines can. Run Home Assistant on another
-host, or add a `macvlan` shim interface on the host.
+With `macvlan`, the Docker host itself cannot reach the copies; other machines can. Run the clients on another host,
+or add a `macvlan` shim interface on the host.
 
 ## Describe the cameras {#cameras}
 
@@ -52,10 +52,9 @@ Every key is described in the
 A password is never written in `cameras.yaml`: write `${KEY}` there, and put the raw password in the file
 `secrets/KEY`, alone, without quotes.
 
-- `secrets/ENTRANCE_SOURCE_PASSWORD`: the password the copy gives the real camera, for example the Tapo camera
-  account.
-- `secrets/ENTRANCE_OUTPUT_PASSWORD`: the password of the copy's RTSP account (user `cams`), which Protect and Home
-  Assistant give the copy.
+- `secrets/ENTRANCE_SOURCE_PASSWORD`: the password the copy gives the real camera, that of its account.
+- `secrets/ENTRANCE_OUTPUT_PASSWORD`: the password of the copy's RTSP account (user `cams`), which the clients give the
+  copy.
 
 The characters `@`, `^`, `:` and `/` are accepted. Only `"`, `\`, control characters and Unicode spaces (such as a
 no-break space) are refused: the copy then stops with one line naming the file, never its value.
@@ -74,4 +73,4 @@ the go2rtc image the first time, then starts or updates every copy.
 - `just down` stops every copy.
 - `just check` checks the code and a render of the example.
 
-Next: [adopt the copies in UniFi Protect](unifi-protect.md).
+Next: [add the copies to a client](onvif-clients.md).

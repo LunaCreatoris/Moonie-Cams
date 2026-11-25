@@ -1,16 +1,16 @@
 ---
-title: Partager une Tapo
-description: Le mode proxy partage une Tapo entre UniFi Protect et Home Assistant, pan-tilt et événements compris.
+title: Le mode proxy
+description: Le mode proxy partage une caméra ONVIF entre plusieurs clients, pan-tilt et événements compris.
 order: 3
 ---
 
 ## Pourquoi un proxy {#why-a-proxy}
 
-Une Tapo n'accepte qu'une connexion par flux, et Protect comme Home Assistant la veulent. En `mode: proxy`, la copie
-se présente comme la caméra :
+Certaines caméras n'acceptent qu'une connexion par flux ; c'est le cas des Tapo, pour lesquelles ce mode a été écrit.
+Quand plusieurs clients veulent la même caméra, en `mode: proxy` la copie se présente comme la caméra :
 
 - go2rtc tient la seule session RTSP de chaque flux (`stream1` et `stream2`), sans réencodage ;
-- un petit proxy ONVIF relaie vers la vraie Tapo les lectures, les commandes de pan-tilt et les événements, et
+- un petit proxy ONVIF relaie vers la vraie caméra les lectures, les commandes de pan-tilt et les événements, et
   réécrit les adresses pour qu'elles pointent sur la copie.
 
 Tout autre réglage (redémarrage, réseau, encodeur, image) est refusé : il changerait la caméra pour tous les clients.
@@ -31,18 +31,17 @@ cameras:
     proxy_log: writes
 ```
 
-- `onvif_url` est l'adresse ONVIF de la Tapo, port 2020, sans compte ni chemin.
-- Un seul compte : les clients donnent à la copie le compte caméra de la Tapo, pour ONVIF comme pour RTSP.
+- `onvif_url` est l'adresse ONVIF de la vraie caméra, sans compte ni chemin (port 2020 sur une Tapo).
+- Un seul compte : les clients donnent à la copie le compte de la vraie caméra, pour ONVIF comme pour RTSP.
 - Le proxy répond sur les ports 80 et 2020. Dans ce mode, l'API de go2rtc (MJPEG, HLS, WebRTC) passe sur le port 1984.
 
-## Protect et Home Assistant ensemble {#protect-and-home-assistant}
+## Plusieurs clients ensemble {#several-clients}
 
-1. Retirez la Tapo de Protect si elle y était adoptée en direct, puis adoptez la copie par son adresse avec le compte
-   caméra. Voir [Adopter dans UniFi Protect](unifi-protect.md).
-2. Dans Home Assistant, ajoutez l'intégration ONVIF pointée sur la copie (port 80 ou 2020, compte caméra) : elle a
-   les flux, le pan-tilt et les événements.
-3. L'intégration Tapo de HACS peut garder la vraie caméra pour ses réglages en plus (mode privé, alarme, voyant), mais
-   coupez son flux ou ses entités caméra : sinon elle prend la seule session de la Tapo.
+1. Retirez la vraie caméra de tout client qui la lisait en direct.
+2. Ajoutez la copie à chaque client ONVIF, par son adresse (port 80 ou 2020) et avec le compte de la caméra : chacun
+   a les flux, le pan-tilt et les événements. Voir [Ajouter à un client](onvif-clients.md).
+3. Un outil qui parle encore à la vraie caméra pour ses réglages propres (mode privé, alarme, voyant) peut rester,
+   à condition de ne pas ouvrir son flux : sinon il prend la seule session de la caméra.
 
 ## L'arbitrage du pan-tilt {#ptz-arbitration}
 

@@ -7,8 +7,8 @@ order: 4
 ## À quoi il sert {#purpose}
 
 `mode: copy` fait de la copie un simple répartiteur : une connexion à la source, copiée vers chaque sortie à la fois,
-le format d'entrée compris, passé tel quel. C'est utile pour une source qui n'accepte qu'un client, comme une
-ESP32-CAM ou un flux de Tapo, quand plusieurs clients en veulent une copie.
+le format d'entrée compris, passé tel quel. C'est utile pour une source qui n'accepte qu'un client, quand
+plusieurs clients en veulent une copie.
 
 ```yaml
 cameras:
@@ -20,8 +20,8 @@ cameras:
     ip: 198.51.100.23
 ```
 
-Home Assistant et Protect lisent tous deux `rtsp://cams:MOT_DE_PASSE@198.51.100.23:554/atelier`, et un navigateur
-lit `http://198.51.100.23/api/stream.mjpeg?src=atelier_mjpeg`.
+Tous les clients RTSP lisent `rtsp://cams:MOT_DE_PASSE@198.51.100.23:554/atelier` (une seule sortie RTSP, autant de
+clients que voulu), et un navigateur lit `http://198.51.100.23/api/stream.mjpeg?src=atelier_mjpeg`.
 
 ## Ce que chaque sortie a {#what-each-output-gets}
 
