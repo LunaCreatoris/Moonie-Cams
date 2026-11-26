@@ -24,7 +24,8 @@ A step-by-step guide, from the first camera to adding it to an ONVIF client, is 
 
 - A Linux host running Docker with Docker Compose: each copy gets its own address and MAC on the LAN
   through a `macvlan` network, which Docker Desktop on macOS or Windows does not provide.
-- [just](https://github.com/casey/just): every step is a recipe, and every recipe runs in Docker.
+- Nothing else: every step runs in Docker. [just](https://github.com/casey/just) is optional for a
+  deployment (a shortcut for the same steps) and the contributors' tool (`just ci`).
 - One free address on the LAN for each copy that serves ONVIF or WebRTC, outside the DHCP range.
 
 ## Set up
@@ -40,8 +41,60 @@ A step-by-step guide, from the first camera to adding it to an ONVIF client, is 
    - `secrets/<NAME>_OUTPUT_PASSWORD`: the password of the copy's own RTSP account (user `cams`
      unless `output_user` says otherwise), which the clients give the copy.
 4. Optional: to be told when a camera goes down or comes back, see "Webhook support".
-5. `just up`. The first run builds the patched go2rtc image from source, which takes a few minutes
-   (see "How it is built"). Then `just logs`, `just logs cam-c100`, `just down`.
+5. Render and start, one of two ways below. No image is published on any registry: compose builds
+   every image from this repository on the Docker host, and the first build of the patched go2rtc
+   takes a few minutes (see "How it is built").
+
+Steps 1 to 3 without just, from the repository root (a trailing newline in a secret file is fine; a
+password typed on a command line stays in the shell's history):
+
+```sh
+cp .env.example .env
+cp cameras.example.yaml cameras.yaml
+printf '%s' 'the-password' > secrets/C100_SOURCE_PASSWORD
+```
+
+On Windows, in PowerShell: `Copy-Item`, and `Set-Content -NoNewline -Path secrets\C100_SOURCE_PASSWORD -Value 'the-password'`.
+
+### Deploy with Docker Compose, or as a Portainer stack (no just)
+
+```sh
+docker compose -f tools/compose.yml run --rm render
+docker compose --env-file .env -f generated/compose.yml up -d --build --remove-orphans
+```
+
+The first command renders `cameras.yaml` into `generated/` in the tool image (Docker only, no Python
+on the host; `tools/compose.yml` sits in its own folder so the stack's `.env` never renames it). The
+second builds the images and starts every copy; `logs -f [service]` and `down` take the same
+`--env-file .env -f generated/compose.yml`. On a Linux host the rendered files belong to root, as
+with `just render`; add `--user "$(id -u):$(id -g)"` after `run` to keep them yours.
+
+Portainer cannot run the render, and a Git-repository stack cannot work here: Portainer documents
+image builds from a Git stack as not fully supported (and failing on agent environments since
+2.29.2), and the Community Edition mounts no file from the repository (relative paths are a Business
+Edition feature), while every copy mounts its rendered config. What works is its web editor, with the
+files on the Docker host: render there with `--host-dir`, the absolute path of `generated/` on that
+host, so the compose file names its config files and secrets (`<host-dir>/../secrets/<KEY>`) by
+that path:
+
+```sh
+docker compose -f tools/compose.yml run --rm render cameras.yaml generated --env=.env --host-dir=/opt/moonie-cams/generated
+docker compose --env-file .env -f generated/compose.yml build
+```
+
+Then add a stack named as `COMPOSE_PROJECT_NAME` (default `moonie-cams`) with the web editor, paste
+`generated/compose.yml`, and load `.env` as its environment variables. Portainer may warn that a
+secret file does not exist (its compose looks inside its own container); the copy still gets it
+from the host. To update, render and build again, paste the new file and update the stack.
+`just webeditor-check` proves it: it renders into a volume on the host, builds there, and deploys the
+compose text alone from an empty folder.
+
+### Deploy with just
+
+`just up` renders (the same `tools/compose.yml`), builds and starts. Then `just logs`,
+`just logs cam-c100`, `just down`.
+
+### Several stacks, and the checks
 
 Several stacks on one Docker host (for example one per camera VLAN): give each checkout its own
 `COMPOSE_PROJECT_NAME` in `.env` (default `moonie-cams`). The project's volume, `lan` network and

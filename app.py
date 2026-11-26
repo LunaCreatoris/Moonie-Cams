@@ -3,12 +3,15 @@
 """Render cameras.yaml into one go2rtc config per camera plus one compose file.
 
 Usage:
-    python app.py render CAMERAS_YAML OUT_DIR [--allow-placeholders] [--env=ENV_FILE]
+    python app.py render CAMERAS_YAML OUT_DIR [--allow-placeholders] [--env=ENV_FILE] [--host-dir=DIR]
 
 Each camera gets its own go2rtc container. go2rtc does all the streaming work; this
 script only writes its config, refuses an output that repeats the input format (unless
 the camera sets mode: copy), and adds an ffmpeg transcode source when an output needs a
 codec the input lacks. ENV_FILE (the .env docker compose reads) gives the webhook settings.
+DIR is where OUT_DIR sits on the Docker host, as an absolute path: the compose file then names
+its config files and secrets by that path, so it also works pasted into a web editor (such as
+Portainer's) that has none of the rendered files at hand. The secrets are in DIR's parent's secrets/.
 """
 
 import hashlib
@@ -18,7 +21,7 @@ import math
 import re
 import shutil
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 import yaml
@@ -49,6 +52,8 @@ STATE_DIR = "/state"
 DEFAULT_PROJECT = "moonie-cams"
 # Docker compose's own rule for a project name
 PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9_-]*", re.ASCII)
+# What --host-dir may hold: an absolute POSIX path, nothing a compose short entry or a shell trips on
+HOST_DIR_RE = re.compile(r"/[A-Za-z0-9/._-]+", re.ASCII)
 # Docker's own rule for a network name
 NETWORK_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*", re.ASCII)
 
@@ -527,7 +532,8 @@ def go2rtc_config(cam: dict) -> dict:
     return config
 
 
-def compose_service(cam: dict, config_text: str) -> tuple[dict, list[str]]:
+def compose_service(cam: dict, config_text: str, files: str = ".") -> tuple[dict, list[str]]:
+    """The go2rtc service of a camera; files is where its config file is, as compose names it."""
     name = cam["name"]
     keys = sorted(set(SECRET_REF_RE.findall(config_text)))
     service: dict = {
@@ -536,7 +542,7 @@ def compose_service(cam: dict, config_text: str) -> tuple[dict, list[str]]:
         "container_name": container_name(name),
         "restart": "unless-stopped",
         "environment": {"TZ": "${TZ:-UTC}", "CREDENTIALS_DIRECTORY": "/run/secrets", **onvif_env(cam)},
-        "volumes": [f"./{name}.yaml:/config/go2rtc.yaml:ro"],
+        "volumes": [f"{files}/{name}.yaml:/config/go2rtc.yaml:ro"],
         "secrets": [{"source": key.lower(), "target": key} for key in keys],
     }
     if cam.get("mode") == "copy":
@@ -718,7 +724,25 @@ def webhook_service(project: str, posts: bool, token: bool) -> dict:
     return service
 
 
-def render(cameras_file: Path, out_dir: Path, allow_placeholders: bool = False, env: dict | None = None) -> list[Path]:
+def check_host_dir(host_dir: str) -> PurePosixPath:
+    """The rendered folder's absolute path on the Docker host, which runs Linux (macvlan)."""
+    path = PurePosixPath(host_dir)
+    if not path.is_absolute() or path == PurePosixPath("/") or ".." in path.parts:
+        raise ConfigError(f"--host-dir {host_dir!r} must be an absolute path on the Docker host, below /")
+    # A colon would split a short volume entry, a space or a quote is easy to get wrong in a shell
+    if not HOST_DIR_RE.fullmatch(str(path)):
+        raise ConfigError(f"--host-dir {host_dir!r}: use letters, digits, / . _ and - only")
+    return path
+
+
+def render(
+    cameras_file: Path,
+    out_dir: Path,
+    allow_placeholders: bool = False,
+    env: dict | None = None,
+    host_dir: str | None = None,
+) -> list[Path]:
+    host = check_host_dir(host_dir) if host_dir is not None else None
     posts = check_webhook(env or {})
     project = project_name(env or {})
     data = yaml.safe_load(cameras_file.read_text(encoding="utf-8")) or {}
@@ -735,6 +759,10 @@ def render(cameras_file: Path, out_dir: Path, allow_placeholders: bool = False, 
         seen.add(cam["name"])
 
     secrets_dir = Path("..") / "secrets"
+    # How compose names the rendered files and the secrets: relative to the compose file, or by
+    # their absolute path on the Docker host
+    files = host.as_posix() if host else "."
+    secret_files = (host.parent / "secrets") if host else PurePosixPath(secrets_dir.as_posix())
     compose: dict = {"name": project, "services": {}, "secrets": {}}
     written = []
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -753,7 +781,7 @@ def render(cameras_file: Path, out_dir: Path, allow_placeholders: bool = False, 
         path = out_dir / f"{cam['name']}.yaml"
         path.write_text(text, encoding="utf-8", newline="\n")
         written.append(path)
-        service, keys = compose_service(cam, text)
+        service, keys = compose_service(cam, text, files)
         compose["services"][f"cam-{cam['name']}"] = service
         if cam.get("mode") == "proxy":
             compose["services"][f"cam-{cam['name']}-onvif"] = proxy_service(cam)
@@ -761,14 +789,14 @@ def render(cameras_file: Path, out_dir: Path, allow_placeholders: bool = False, 
             compose["services"][f"cam-{cam['name']}-mirror"] = mirror
             shutil.copytree(SENTINEL_DIR, out_dir / "sentinel", dirs_exist_ok=True, ignore=ignore)
         for key in keys:
-            compose["secrets"][key.lower()] = {"file": (secrets_dir / key).as_posix()}
+            compose["secrets"][key.lower()] = {"file": (secret_files / key).as_posix()}
     if any(name.endswith("-mirror") for name in compose["services"]):
         # The token is optional: its secret exists only when its file does
         token = (out_dir / secrets_dir / WEBHOOK_TOKEN_KEY).is_file()
         compose["services"][WEBHOOK_SERVICE] = webhook_service(compose["name"], posts, token)
         compose["volumes"] = {STATE_VOLUME: {}}
         if token:
-            compose["secrets"][WEBHOOK_TOKEN_KEY.lower()] = {"file": (secrets_dir / WEBHOOK_TOKEN_KEY).as_posix()}
+            compose["secrets"][WEBHOOK_TOKEN_KEY.lower()] = {"file": (secret_files / WEBHOOK_TOKEN_KEY).as_posix()}
         shutil.copytree(WEBHOOK_DIR, out_dir / "webhook", dirs_exist_ok=True, ignore=ignore)
     if any(cam.get("ip") is not None for cam in cameras):
         compose["networks"] = {
@@ -808,7 +836,10 @@ def main(argv: list[str]) -> int:
     try:
         env_files = [a.split("=", 1)[1] for a in argv if a.startswith("--env=")]
         env = read_env(Path(env_files[-1])) if env_files else {}
-        files = render(Path(args[1]), Path(args[2]), "--allow-placeholders" in argv, env)
+        host_dirs = [a.split("=", 1)[1] for a in argv if a.startswith("--host-dir=")]
+        files = render(
+            Path(args[1]), Path(args[2]), "--allow-placeholders" in argv, env, host_dirs[-1] if host_dirs else None
+        )
     except ConfigError as err:
         print(f"error: {err}", file=sys.stderr)
         return 1

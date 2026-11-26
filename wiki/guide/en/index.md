@@ -32,7 +32,8 @@ In every mode, a copy goes dark while its camera is offline, and comes back with
 
 ## The guide's pages {#pages}
 
-- [Getting started](getting-started.md): describe the cameras, store the passwords, start the copies.
+- [Getting started](getting-started.md): describe the cameras, store the passwords, start the copies with Docker
+  Compose, Portainer or just.
 - [Add to a client](onvif-clients.md): adding by IP address, what the client sees, reading over RTSP.
 - [Proxy mode](proxy-mode.md): share an ONVIF camera, pan-tilt arbitration and the log.
 - [Copy mode](copy-mode.md): one stream shared by several clients.

@@ -1,0 +1,13 @@
+# Rendered by `just webeditor-check` (see check.sh). One copy-mode camera, so that go2rtc serves
+# /api/health (on port 80) and the check can see the config file it loaded. Its source is never
+# reached (a documentation address): the check is about the stack, not the stream.
+# No ip and no host port: no macvlan network, so the check runs on any Docker host.
+# No state sentinel: the check builds only the go2rtc image.
+cameras:
+  - name: webcheck
+    mode: copy
+    input: rtsp
+    source: rtsp://192.0.2.10:554/stream1
+    outputs: [rtsp, mjpeg]
+    mirror_state: false
+    ports: {}

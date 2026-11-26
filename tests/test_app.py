@@ -1255,3 +1255,110 @@ def test_the_webhook_check_runs_the_services_as_the_rendered_compose_does(tmp_pa
         for key in ("cap_drop", "read_only", "security_opt", "restart", "volumes"):
             assert check["services"][checked][key] == compose["services"][rendered][key], (checked, key)
     assert check["services"]["cam-mirror"]["environment"]["STATE_DIR"] == "/state"
+
+
+# Deploying with no just: tools/compose.yml renders, the rendered compose file runs on plain docker compose
+# or pasted into a web editor (--host-dir).
+
+
+def test_host_dir_names_files_and_secrets_by_their_host_path(tmp_path):
+    cam = {
+        "name": "cam",
+        "input": "rtsp",
+        "source": "rtsp://cams:${CAM_SOURCE_PASSWORD}@192.0.2.2/s1",
+        "outputs": ["onvif"],
+        "ip": "198.51.100.20",
+    }
+    out = tmp_path / "out"
+    app.render(write_cameras(tmp_path, [cam]), out, host_dir="/opt/moonie-cams/generated")
+    compose = yaml.safe_load((out / "compose.yml").read_text(encoding="utf-8"))
+    service = compose["services"]["cam-cam"]
+    assert service["volumes"] == ["/opt/moonie-cams/generated/cam.yaml:/config/go2rtc.yaml:ro"]
+    assert compose["secrets"] == {
+        "cam_output_password": {"file": "/opt/moonie-cams/secrets/CAM_OUTPUT_PASSWORD"},
+        "cam_source_password": {"file": "/opt/moonie-cams/secrets/CAM_SOURCE_PASSWORD"},
+    }
+    # The images are still built from the rendered folder when compose runs there
+    assert service["build"] == "./go2rtc"
+
+
+def test_host_dir_names_the_webhook_token_by_its_host_path(tmp_path):
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / app.WEBHOOK_TOKEN_KEY).write_text("token", encoding="utf-8")
+    cam = {"name": "cam", "input": "rtsp", "source": "rtsp://192.0.2.2/s1", "outputs": ["onvif"], "ip": "198.51.100.20"}
+    out = tmp_path / "out"
+    app.render(write_cameras(tmp_path, [cam]), out, host_dir="/srv/cams/out")
+    compose = yaml.safe_load((out / "compose.yml").read_text(encoding="utf-8"))
+    assert compose["secrets"]["cams_webhook_token"] == {"file": "/srv/cams/secrets/CAMS_WEBHOOK_TOKEN"}
+
+
+def test_without_host_dir_files_stay_relative(tmp_path):
+    _, compose = render_one(tmp_path, source="rtsp://cams:${CAM_SOURCE_PASSWORD}@192.0.2.2/s1")
+    assert compose["services"]["cam-cam"]["volumes"] == ["./cam.yaml:/config/go2rtc.yaml:ro"]
+    assert compose["secrets"]["cam_source_password"] == {"file": "../secrets/CAM_SOURCE_PASSWORD"}
+
+
+@pytest.mark.parametrize(
+    "host_dir",
+    ["generated", "./generated", "/", "/opt/../etc", "C:/cams", "/opt/my cams", "/opt/cams:rw", "/opt/cams'", ""],
+)
+def test_bad_host_dirs_are_refused(tmp_path, host_dir):
+    cam = {"name": "cam", "input": "rtsp", "source": "rtsp://192.0.2.2/s1", "outputs": ["onvif"], "ip": "198.51.100.20"}
+    with pytest.raises(app.ConfigError, match="--host-dir"):
+        app.render(write_cameras(tmp_path, [cam]), tmp_path / "out", host_dir=host_dir)
+
+
+def test_main_takes_host_dir(tmp_path):
+    cam = {"name": "cam", "input": "rtsp", "source": "rtsp://192.0.2.2/s1", "outputs": ["onvif"], "ip": "198.51.100.20"}
+    path = write_cameras(tmp_path, [cam])
+    assert app.main(["render", str(path), str(tmp_path / "out"), "--host-dir=/opt/cams/generated"]) == 0
+    compose = yaml.safe_load((tmp_path / "out" / "compose.yml").read_text(encoding="utf-8"))
+    assert compose["services"]["cam-cam"]["volumes"] == ["/opt/cams/generated/cam.yaml:/config/go2rtc.yaml:ro"]
+
+
+def test_tools_compose_renders_like_just_render():
+    tools = yaml.safe_load((ROOT / "tools" / "compose.yml").read_text(encoding="utf-8"))
+    service = tools["services"]["render"]
+    # The repository root, the tool image of `just tools`, and nothing the stack's .env can rename
+    assert (service["build"], service["image"], service["volumes"]) == ("..", "moonie-cams-tools", ["..:/work"])
+    assert tools["name"] == "moonie-cams-tools"
+    assert not (ROOT / "tools" / ".env").exists()
+    assert service["network_mode"] == "none"
+    assert service["working_dir"] == "/work"
+    assert service["entrypoint"] + service["command"] == [
+        "python",
+        "app.py",
+        "render",
+        "cameras.yaml",
+        "generated",
+        "--env=.env",
+    ]
+    justfile = (ROOT / "justfile").read_text(encoding="utf-8")
+    assert '"tools" / "compose.yml")}} run --rm render' in justfile
+    assert 'tools := "moonie-cams-tools"' in justfile
+
+
+def test_rendered_compose_reads_only_what_env_example_sets(tmp_path):
+    # Plain docker compose (or a web editor's variables) is enough: no value comes from just
+    app.render(ROOT / "cameras.example.yaml", tmp_path, allow_placeholders=True)
+    text = (tmp_path / "compose.yml").read_text(encoding="utf-8")
+    used = set(re.findall(r"\$\{([A-Z_][A-Z0-9_]*)", text))
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    known = set(re.findall(r"^#?([A-Z_][A-Z0-9_]*)=", example, re.MULTILINE))
+    assert used
+    assert used <= known, used - known
+
+
+def test_webeditor_check_renders_one_copy_with_its_secret_on_the_host(tmp_path):
+    out = tmp_path / "generated"
+    app.render(ROOT / "tests" / "webeditor_check" / "cameras.check.yaml", out, host_dir="/data/generated")
+    compose = yaml.safe_load((out / "compose.yml").read_text(encoding="utf-8"))
+    assert list(compose["services"]) == ["cam-webcheck"]
+    service = compose["services"]["cam-webcheck"]
+    # No macvlan network and no host port: the check runs on any Docker host
+    assert "networks" not in compose and service["ports"] == []
+    assert service["volumes"] == ["/data/generated/webcheck.yaml:/config/go2rtc.yaml:ro"]
+    assert compose["secrets"] == {"webcheck_output_password": {"file": "/data/secrets/WEBCHECK_OUTPUT_PASSWORD"}}
+    script = (ROOT / "tests" / "webeditor_check" / "check.sh").read_text(encoding="utf-8")
+    assert "--host-dir=$dir/generated" in script
+    assert "$dir/secrets/WEBCHECK_OUTPUT_PASSWORD" in script

@@ -1,0 +1,20 @@
+# Renders cameras.yaml into generated/ with no just and no Python on the host, from the repository root:
+#   docker compose -f tools/compose.yml run --rm render
+# Extra arguments replace the default ones, for example to name the rendered folder by its path on the
+# Docker host (a stack pasted into a web editor such as Portainer's):
+#   docker compose -f tools/compose.yml run --rm render cameras.yaml generated --env=.env --host-dir=/opt/moonie-cams/generated
+# This file sits in its own folder so that compose does not read the stack's .env here: its
+# COMPOSE_PROJECT_NAME would make this one-off container part of the camera stack.
+name: moonie-cams-tools
+services:
+  render:
+    # The same tool image as `just tools` (Dockerfile at the repository root)
+    build: ..
+    image: moonie-cams-tools
+    volumes:
+      - ..:/work
+    working_dir: /work
+    # Rendering needs no network
+    network_mode: none
+    entrypoint: ["python", "app.py", "render"]
+    command: ["cameras.yaml", "generated", "--env=.env"]

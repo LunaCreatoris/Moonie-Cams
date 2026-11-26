@@ -28,13 +28,14 @@ test: tools
 check: test
     {{run}} python app.py render cameras.example.yaml .check --allow-placeholders --env=.env.example
     docker compose --env-file .env.example -f .check/compose.yml config --quiet
+    docker compose -f tools/compose.yml config --quiet
 
 # The merge gate, and the only CI: lint, every test, then render and validate the example
 ci: check
 
-# Render cameras.yaml into generated/ (one go2rtc config per camera, plus compose.yml)
+# Render cameras.yaml into generated/ (one go2rtc config per camera, plus compose.yml), as tools/compose.yml does without just
 render: tools
-    {{run}} python app.py render cameras.yaml generated --env=.env
+    docker compose -f {{quote(justfile_directory() / "tools" / "compose.yml")}} run --rm render
 
 # Render, then start (or update) every camera copy
 up: render
@@ -116,6 +117,16 @@ webhook-check:
 health name seconds="2":
     docker cp health.py cams-{{name}}:/tmp/health.py
     docker exec cams-{{name}} python3 /tmp/health.py {{seconds}}
+
+# The Docker CLI (with compose) that plays a web editor's compose client. Pinned by tag and digest
+docker_cli := "docker:28.5.2-cli@sha256:625d9431a9f54c5a2bc90f24f0e1c3d55b1349fd857dd85035f98c2c9acbdd4d"
+webeditor_volume := "moonie-cams-webeditor-check"
+
+# Deploy a stack rendered with --host-dir the way a web editor (Portainer's) does: compose text only, files on the host
+webeditor-check: tools
+    docker volume create {{webeditor_volume}}
+    docker run --rm -v {{quote(justfile_directory())}}:/work:ro -v {{webeditor_volume}}:/out -w /work {{tools}} sh -c "mkdir -p /out/src/tests && cp -R app.py go2rtc /out/src/ && cp -R tests/webeditor_check /out/src/tests/"
+    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v {{quote(justfile_directory() / "tests" / "webeditor_check")}}:/check:ro -e TOOLS={{tools}} -e CLI_IMAGE={{docker_cli}} {{docker_cli}} sh /check/check.sh
 
 copy_check := "docker compose -p moonie-cams-copy-check -f .copy-check/out/compose.yml -f tests/copy_check/compose.override.yml"
 

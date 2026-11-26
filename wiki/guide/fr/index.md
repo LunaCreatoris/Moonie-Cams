@@ -32,7 +32,8 @@ Dans tous les modes, une copie s'éteint tant que sa caméra est hors ligne, et 
 
 ## Les pages du guide {#pages}
 
-- [Démarrer](getting-started.md) : décrire les caméras, ranger les mots de passe, lancer les copies.
+- [Démarrer](getting-started.md) : décrire les caméras, ranger les mots de passe, lancer les copies avec Docker
+  Compose, Portainer ou just.
 - [Ajouter à un client](onvif-clients.md) : l'ajout par adresse IP, ce que le client voit, la lecture en RTSP.
 - [Le mode proxy](proxy-mode.md) : partager une caméra ONVIF, l'arbitrage du pan-tilt et le journal.
 - [Le mode copie](copy-mode.md) : un flux partagé par plusieurs clients.
